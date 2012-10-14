@@ -1,0 +1,3389 @@
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/fs/buffer.c linux/fs/buffer.c
+--- linux-2.6.27.55/fs/buffer.c	2010-10-28 23:04:39.000000000 -0500
++++ linux/fs/buffer.c	2012-10-13 17:11:11.000000000 -0500
+@@ -1926,6 +1926,122 @@
+ 	return err;
+ }
+ 
++/*
++ * Modified __block_prepare_write for ext2bp
++ * Author: vijayc@cs.wisc.edu
++ */
++int __ext2bp_block_prepare_write(struct inode *inode, struct page *page,
++		unsigned from, unsigned to, get_block_t *get_block)
++{
++	unsigned block_start, block_end;
++	sector_t block;
++	int err = 0;
++	unsigned blocksize, bbits;
++	struct buffer_head *bh, *head, *wait[2], **wait_bh=wait;
++
++	BUG_ON(!PageLocked(page));
++	BUG_ON(from > PAGE_CACHE_SIZE);
++	BUG_ON(to > PAGE_CACHE_SIZE);
++	BUG_ON(from > to);
++
++	blocksize = 1 << inode->i_blkbits;
++
++	if (!page_has_buffers(page))
++		create_empty_buffers(page, blocksize, 0);
++	head = page_buffers(page);
++
++	bbits = inode->i_blkbits;
++	block = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
++
++	for(bh = head, block_start = 0; bh != head || !block_start;
++	    block++, block_start=block_end, bh = bh->b_this_page) {
++
++		block_end = block_start + blocksize;
++		if (block_end <= from || block_start >= to) {
++			if (PageUptodate(page)) {	
++				if (!buffer_uptodate(bh))
++					set_buffer_uptodate(bh);
++
++				void* pageaddr = kmap(bh->b_page);
++				unsigned long long inum = inode->i_ino;
++				memcpy(pageaddr, (char*) &(inum), 8);
++				kunmap(bh->b_page);
++			}
++			continue;
++		}
++		if (buffer_new(bh)) {
++			clear_buffer_new(bh);
++		}
++		if (!buffer_mapped(bh)) {
++			WARN_ON(bh->b_size != blocksize);
++			err = get_block(inode, block, bh, 1);
++			if (err)
++				break;
++			if (buffer_new(bh)) {
++				unmap_underlying_metadata(bh->b_bdev,
++							bh->b_blocknr);
++				if (PageUptodate(page)) {
++					clear_buffer_new(bh);
++					set_buffer_uptodate(bh);
++					mark_buffer_dirty(bh);
++
++					void* pageaddr = kmap(bh->b_page);
++					unsigned long long inum = inode->i_ino;
++					memcpy(pageaddr, (char*) &(inum), 8);
++					kunmap(bh->b_page);
++
++					continue;
++				}
++				if (block_end > to || block_start < from) {
++					zero_user_segments(page,
++							to, block_end,
++							block_start, from);
++
++					void* pageaddr = kmap(page);
++					unsigned long long inum = inode->i_ino;
++					memcpy(pageaddr, (char*) &(inum), 8);
++					kunmap(page);
++				}
++				continue;
++			}
++		}
++		if (PageUptodate(page)) {
++			if (!buffer_uptodate(bh))
++				set_buffer_uptodate(bh);
++	
++			void* pageaddr = kmap(bh->b_page);
++			unsigned long long inum = inode->i_ino;
++			memcpy(pageaddr, (char*) &(inum), 8);
++			kunmap(bh->b_page);
++	
++			continue; 
++		}
++		if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
++		    !buffer_unwritten(bh) &&
++		     (block_start < from || block_end > to)) {
++				
++			ll_rw_block(READ, 1, &bh);
++			*wait_bh++=bh;
++
++			void* pageaddr = kmap(bh->b_page);
++			unsigned long long inum = inode->i_ino;
++			memcpy(pageaddr, (char*) &(inum), 8);
++			kunmap(bh->b_page);
++		}
++	}
++	/*
++	 * If we issued read requests - let them complete.
++	 */
++	while(wait_bh > wait) {
++		wait_on_buffer(*--wait_bh);
++		if (!buffer_uptodate(*wait_bh))
++			err = -EIO;
++	}
++	if (unlikely(err))
++		page_zero_new_buffers(page, from, to);
++	return err;
++}
++
+ static int __block_commit_write(struct inode *inode, struct page *page,
+ 		unsigned from, unsigned to)
+ {
+@@ -2022,6 +2138,85 @@
+ }
+ EXPORT_SYMBOL(block_write_begin);
+ 
++/* block_write_begin changed for ext2bp - Vijay and Tushar
++ */
++int ext2bp_block_write_begin(struct file *file, struct address_space *mapping,
++			loff_t pos, unsigned len, unsigned flags,
++			struct page **pagep, void **fsdata,
++			get_block_t *get_block)
++{
++	struct inode *inode = mapping->host;
++	int status = 0;
++	struct page *page;
++	pgoff_t index;
++	unsigned start, end;
++	int ownpage = 0;
++
++	index = ((unsigned long)pos) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	start = (((unsigned long)pos) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE));
++        start = start + EXT2BP_HEADER_SIZE;
++	end = start + len;
++
++	BUG_ON(end > PAGE_CACHE_SIZE);
++
++	page = *pagep;
++	if (page == NULL) {
++		ownpage = 1;
++		page = grab_cache_page_write_begin(mapping, index, flags);
++		if (!page) {
++			status = -ENOMEM;
++			goto out;
++		}
++		*pagep = page;
++	} else
++		BUG_ON(!PageLocked(page));
++
++	/* This function does the writing of the backpointer information
++	 * into the pages. 
++	 */
++	status = __ext2bp_block_prepare_write(inode, page, start, end, get_block);
++
++	void* pageaddr = kmap(page);
++	unsigned long long cal_inode_num = 0;
++	unsigned long long exp = 1;
++	int i;		
++	for(i = 0; i < EXT2BP_HEADER_SIZE; i++) {
++		unsigned char* n = (unsigned char*)(pageaddr + i);
++		unsigned long long value = *n;
++		value = value*exp;
++		if(value > 0) cal_inode_num += value;
++		exp*=256;
++	} 	
++	kunmap(page);
++
++	if(cal_inode_num != inode->i_ino) {
++		status = -EIO;
++	}
++
++	if (unlikely(status)) {
++		ClearPageUptodate(page);
++
++		if (ownpage) {
++			unlock_page(page);
++			page_cache_release(page);
++			*pagep = NULL;
++
++			/*
++			 * prepare_write() may have instantiated a few blocks
++			 * outside i_size.  Trim these off again. Don't need
++			 * i_size_read because we hold i_mutex.
++			 */
++			if (pos + len > inode->i_size)
++				vmtruncate(inode, inode->i_size);
++		}
++		goto out;
++	}
++
++out:
++	return status;
++}
++EXPORT_SYMBOL(ext2bp_block_write_begin);
++
+ int block_write_end(struct file *file, struct address_space *mapping,
+ 			loff_t pos, unsigned len, unsigned copied,
+ 			struct page *page, void *fsdata)
+@@ -2095,6 +2290,80 @@
+ }
+ EXPORT_SYMBOL(generic_write_end);
+ 
++int ext2bp_block_write_end(struct file *file, struct address_space *mapping,
++			loff_t pos, unsigned len, unsigned copied,
++			struct page *page, void *fsdata)
++{
++	struct inode *inode = mapping->host;
++	unsigned start;
++
++	start = (((unsigned long)pos) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE));
++        start += EXT2BP_HEADER_SIZE;
++
++	if (unlikely(copied < len)) {
++		/*
++		 * The buffers that were written will now be uptodate, so we
++		 * don't have to worry about a readpage reading them and
++		 * overwriting a partial write. However if we have encountered
++		 * a short write and only partially written into a buffer, it
++		 * will not be marked uptodate, so a readpage might come in and
++		 * destroy our partial write.
++		 *
++		 * Do the simplest thing, and just treat any short write to a
++		 * non uptodate page as a zero-length write, and force the
++		 * caller to redo the whole thing.
++		 */
++		if (!PageUptodate(page))
++			copied = 0;
++
++		page_zero_new_buffers(page, start+copied, start+len);
++	}
++	flush_dcache_page(page);
++
++	/* This could be a short (even 0-length) commit */
++	__block_commit_write(inode, page, start, start+copied);
++
++	return copied;
++}
++EXPORT_SYMBOL(ext2bp_block_write_end);
++
++int ext2bp_write_end(struct file *file, struct address_space *mapping,
++			loff_t pos, unsigned len, unsigned copied,
++			struct page *page, void *fsdata)
++{
++	struct inode *inode = mapping->host;
++	int i_size_changed = 0;
++
++	copied = ext2bp_block_write_end(file, mapping, pos, len, copied, page, fsdata);
++
++	/*
++	 * No need to use i_size_read() here, the i_size
++	 * cannot change under us because we hold i_mutex.
++	 *
++	 * But it's important to update i_size while still holding page lock:
++	 * page writeout could otherwise come in and zero beyond i_size.
++	 */
++	
++	if (pos+copied > inode->i_size) {
++		i_size_write(inode, pos+copied);
++		i_size_changed = 1;
++	}
++
++	unlock_page(page);
++	page_cache_release(page);
++
++	/*
++	 * Don't mark the inode dirty under page lock. First, it unnecessarily
++	 * makes the holding time of page lock longer. Second, it forces lock
++	 * ordering of page lock and transaction start for journaling
++	 * filesystems.
++	 */
++	if (i_size_changed)
++		mark_inode_dirty(inode);
++
++	return copied;
++}
++EXPORT_SYMBOL(ext2bp_write_end);
+ /*
+  * block_is_partially_uptodate checks whether buffers within a page are
+  * uptodate or not.
+@@ -2235,6 +2504,105 @@
+ 	return 0;
+ }
+ 
++/*
++ * Vijay: Modified block_read_full_page for ext2bp
++ */
++int ext2bp_block_read_full_page(struct page *page, get_block_t *get_block)
++{
++	struct inode *inode = page->mapping->host;
++
++	sector_t iblock, lblock;
++	struct buffer_head *bh, *head, *arr[MAX_BUF_PER_PAGE];
++	unsigned int blocksize;
++	int nr, i;
++	int fully_mapped = 1;
++
++	BUG_ON(!PageLocked(page));
++	blocksize = 1 << inode->i_blkbits;
++	if (!page_has_buffers(page))
++		create_empty_buffers(page, blocksize, 0);
++	head = page_buffers(page);
++
++	// Vijay: We need to use the physical inode size instead of the logical size
++	unsigned long log_size = i_size_read(inode);
++	unsigned long num_headers = 1 + log_size/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	// Subtract one if it is a perfect multiple
++	if(log_size%(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) == 0) num_headers--;
++	unsigned long total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++	unsigned long total_size = log_size + total_header_size;
++
++	iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - inode->i_blkbits);
++	lblock = (total_size + blocksize - 1) >> inode->i_blkbits;
++	bh = head;
++	nr = 0;
++	i = 0;
++
++	do {
++		if (buffer_uptodate(bh))
++			continue;
++
++		if (!buffer_mapped(bh)) {
++			int err = 0;
++
++			fully_mapped = 0;
++			if (iblock < lblock) {
++				WARN_ON(bh->b_size != blocksize);
++				err = get_block(inode, iblock, bh, 0);
++				if (err)
++					SetPageError(page);
++			}
++			if (!buffer_mapped(bh)) {
++				zero_user(page, i * blocksize, blocksize);
++				if (!err)
++					set_buffer_uptodate(bh);
++				continue;
++			}
++			/*
++			 * get_block() might have updated the buffer
++			 * synchronously
++			 */
++			if (buffer_uptodate(bh))
++				continue;
++		}
++		arr[nr++] = bh;
++	} while (i++, iblock++, (bh = bh->b_this_page) != head);
++
++	if (fully_mapped)
++		SetPageMappedToDisk(page);
++
++	if (!nr) {
++		/*
++		 * All buffers are uptodate - we can set the page uptodate
++		 * as well. But not if get_block() returned an error.
++		 */
++		if (!PageError(page))
++			SetPageUptodate(page);
++		unlock_page(page);
++		return 0;
++	}
++
++	/* Stage two: lock the buffers */
++	for (i = 0; i < nr; i++) {
++		bh = arr[i];
++		lock_buffer(bh);
++		mark_buffer_async_read(bh);
++	}
++
++	/*
++	 * Stage 3: start the IO.  Check for uptodateness
++	 * inside the buffer lock in case another process reading
++	 * the underlying blockdev brought it uptodate (the sct fix).
++	 */
++	for (i = 0; i < nr; i++) {
++		bh = arr[i];
++		if (buffer_uptodate(bh))
++			end_buffer_async_read(bh, 1);
++		else
++			submit_bh(READ, bh);
++	}
++	return 0;
++}
++
+ /* utility function for filesystems that need to do work on expanding
+  * truncates.  Uses filesystem pagecache writes to allow the filesystem to
+  * deal with the hole.  
+@@ -2863,6 +3231,84 @@
+ 	return err;
+ }
+ 
++/* Vijay: block_truncate_page modified for ext2bp */
++int ext2bp_block_truncate_page(struct address_space *mapping,
++			loff_t from, get_block_t *get_block)
++{
++	pgoff_t index = (unsigned long)from / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	
++	unsigned offset = (((unsigned long)from) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE));
++ 
++	unsigned blocksize;
++	sector_t iblock;
++	unsigned length, pos;
++	struct inode *inode = mapping->host;
++	struct page *page;
++	struct buffer_head *bh;
++	int err;
++
++	blocksize = 1 << inode->i_blkbits;
++	length = offset % (blocksize - EXT2BP_HEADER_SIZE -1);
++
++	/* Block boundary? Nothing to do */
++	if (!length)
++		return 0;
++
++	length = blocksize - length;
++	iblock = (sector_t)index << (PAGE_CACHE_SHIFT - inode->i_blkbits);
++	
++	page = grab_cache_page(mapping, index);
++	err = -ENOMEM;
++	if (!page)
++		goto out;
++
++	if (!page_has_buffers(page))
++		create_empty_buffers(page, blocksize, 0);
++
++	/* Find the buffer that contains "offset" */
++	bh = page_buffers(page);
++	pos = blocksize;
++	while (offset >= pos) {
++		bh = bh->b_this_page;
++		iblock++;
++		pos += blocksize;
++	}
++
++	err = 0;
++	if (!buffer_mapped(bh)) {
++		WARN_ON(bh->b_size != blocksize);
++		err = get_block(inode, iblock, bh, 0);
++		if (err)
++			goto unlock;
++		/* unmapped? It's a hole - nothing to do */
++		if (!buffer_mapped(bh))
++			goto unlock;
++	}
++
++	/* Ok, it's mapped. Make sure it's up-to-date */
++	if (PageUptodate(page))
++		set_buffer_uptodate(bh);
++
++	if (!buffer_uptodate(bh) && !buffer_delay(bh) && !buffer_unwritten(bh)) {
++		err = -EIO;
++		ll_rw_block(READ, 1, &bh);
++		wait_on_buffer(bh);
++		/* Uhhuh. Read error. Complain and punt. */
++		if (!buffer_uptodate(bh))
++			goto unlock;
++	}
++
++	zero_user(page, offset, length);
++	mark_buffer_dirty(bh);
++	err = 0;
++
++unlock:
++	unlock_page(page);
++	page_cache_release(page);
++out:
++	return err;
++}
++
+ /*
+  * The generic ->writepage function for buffer-backed address_spaces
+  */
+@@ -3363,8 +3809,10 @@
+ EXPORT_SYMBOL(block_prepare_write);
+ EXPORT_SYMBOL(block_page_mkwrite);
+ EXPORT_SYMBOL(block_read_full_page);
++EXPORT_SYMBOL(ext2bp_block_read_full_page);
+ EXPORT_SYMBOL(block_sync_page);
+ EXPORT_SYMBOL(block_truncate_page);
++EXPORT_SYMBOL(ext2bp_block_truncate_page);
+ EXPORT_SYMBOL(block_write_full_page);
+ EXPORT_SYMBOL(cont_write_begin);
+ EXPORT_SYMBOL(end_buffer_read_sync);
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/fs/mpage.c linux/fs/mpage.c
+--- linux-2.6.27.55/fs/mpage.c	2010-10-28 23:04:39.000000000 -0500
++++ linux/fs/mpage.c	2012-10-13 17:42:08.000000000 -0500
+@@ -325,6 +325,178 @@
+ 	goto out;
+ }
+ 
++/*
++ * Vijay: Modified do_mpage_readpage for ext2bp with modified offset calculation.
++ */
++static struct bio *
++ext2bp_do_mpage_readpage(struct bio *bio, struct page *page, unsigned nr_pages,
++		sector_t *last_block_in_bio, struct buffer_head *map_bh,
++		unsigned long *first_logical_block, get_block_t get_block)
++{
++	struct inode *inode = page->mapping->host;
++	const unsigned blkbits = inode->i_blkbits;
++	const unsigned blocks_per_page = PAGE_CACHE_SIZE >> blkbits;
++	const unsigned blocksize = 1 << blkbits;
++	sector_t block_in_file;
++	sector_t last_block;
++	sector_t last_block_in_file;
++	sector_t blocks[MAX_BUF_PER_PAGE];
++	unsigned page_block;
++	unsigned first_hole = blocks_per_page;
++	struct block_device *bdev = NULL;
++	int length;
++	int fully_mapped = 1;
++	unsigned nblocks;
++	unsigned relative_block;
++
++	if (page_has_buffers(page))
++		goto confused;
++
++	block_in_file = (sector_t)page->index << (PAGE_CACHE_SHIFT - blkbits);
++	last_block = block_in_file + nr_pages * blocks_per_page;
++	
++	// Vijay: We need to use the physical size here. Adding total header size
++	unsigned long i_size = i_size_read(inode);
++	unsigned long num_headers = 1 + (unsigned long)i_size/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	// Subtract one if it is a perfect multiple
++	if((unsigned long)i_size%(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) == 0) num_headers--;
++	unsigned long total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++	unsigned long total_size = i_size + total_header_size;
++
++	last_block_in_file = (total_size + blocksize - 1) >> blkbits;
++	if (last_block > last_block_in_file)
++		last_block = last_block_in_file;
++	page_block = 0;
++
++	/*
++	 * Map blocks using the result from the previous get_blocks call first.
++	 */
++	nblocks = map_bh->b_size >> blkbits;
++	if (buffer_mapped(map_bh) && block_in_file > *first_logical_block &&
++			block_in_file < (*first_logical_block + nblocks)) {
++		unsigned map_offset = block_in_file - *first_logical_block;
++		unsigned last = nblocks - map_offset;
++
++		for (relative_block = 0; ; relative_block++) {
++			if (relative_block == last) {
++				clear_buffer_mapped(map_bh);
++				break;
++			}
++			if (page_block == blocks_per_page)
++				break;
++			blocks[page_block] = map_bh->b_blocknr + map_offset +
++						relative_block;
++			page_block++;
++			block_in_file++;
++		}
++		bdev = map_bh->b_bdev;
++	}
++
++	/*
++	 * Then do more get_blocks calls until we are done with this page.
++	 */
++	map_bh->b_page = page;
++	while (page_block < blocks_per_page) {
++		map_bh->b_state = 0;
++		map_bh->b_size = 0;
++
++		if (block_in_file < last_block) {
++			map_bh->b_size = (last_block-block_in_file) << blkbits;
++			if (get_block(inode, block_in_file, map_bh, 0))
++				goto confused;
++			*first_logical_block = block_in_file;
++		}
++
++		if (!buffer_mapped(map_bh)) {
++			fully_mapped = 0;
++			if (first_hole == blocks_per_page)
++				first_hole = page_block;
++			page_block++;
++			block_in_file++;
++			clear_buffer_mapped(map_bh);
++			continue;
++		}
++
++		/* some filesystems will copy data into the page during
++		 * the get_block call, in which case we don't want to
++		 * read it again.  map_buffer_to_page copies the data
++		 * we just collected from get_block into the page's buffers
++		 * so readpage doesn't have to repeat the get_block call
++		 */
++		if (buffer_uptodate(map_bh)) {
++			map_buffer_to_page(page, map_bh, page_block);
++			goto confused;
++		}
++	
++		if (first_hole != blocks_per_page)
++			goto confused;		/* hole -> non-hole */
++
++		/* Contiguous blocks? */
++		if (page_block && blocks[page_block-1] != map_bh->b_blocknr-1)
++			goto confused;
++		nblocks = map_bh->b_size >> blkbits;
++		for (relative_block = 0; ; relative_block++) {
++			if (relative_block == nblocks) {
++				clear_buffer_mapped(map_bh);
++				break;
++			} else if (page_block == blocks_per_page)
++				break;
++			blocks[page_block] = map_bh->b_blocknr+relative_block;
++			page_block++;
++			block_in_file++;
++		}
++		bdev = map_bh->b_bdev;
++	}
++
++	if (first_hole != blocks_per_page) {
++		zero_user_segment(page, first_hole << blkbits, PAGE_CACHE_SIZE);
++		if (first_hole == 0) {
++			SetPageUptodate(page);
++			unlock_page(page);
++			goto out;
++		}
++	} else if (fully_mapped) {
++		SetPageMappedToDisk(page);
++	}
++
++	/*
++	 * This page will go to BIO.  Do we need to send this BIO off first?
++	 */
++	if (bio && (*last_block_in_bio != blocks[0] - 1))
++		bio = mpage_bio_submit(READ, bio);
++
++alloc_new:
++	if (bio == NULL) {
++		bio = mpage_alloc(bdev, blocks[0] << (blkbits - 9),
++			  	min_t(int, nr_pages, bio_get_nr_vecs(bdev)),
++				GFP_KERNEL);
++		if (bio == NULL)
++			goto confused;
++	}
++
++	length = first_hole << blkbits;
++	if (bio_add_page(bio, page, length, 0) < length) {
++		bio = mpage_bio_submit(READ, bio);
++		goto alloc_new;
++	}
++
++	if (buffer_boundary(map_bh) || (first_hole != blocks_per_page))
++		bio = mpage_bio_submit(READ, bio);
++	else
++		*last_block_in_bio = blocks[blocks_per_page - 1];
++out:
++	return bio;
++
++confused:
++	if (bio)
++		bio = mpage_bio_submit(READ, bio);
++	if (!PageUptodate(page))
++	        block_read_full_page(page, get_block);
++	else
++		unlock_page(page);
++	goto out;
++}
++
+ /**
+  * mpage_readpages - populate an address space with some pages & start reads against them
+  * @mapping: the address_space
+@@ -401,6 +573,42 @@
+ }
+ EXPORT_SYMBOL(mpage_readpages);
+ 
++/**
++ *  Vijay: Modified mpage_readpages for ext2bp
++ */
++int
++ext2bp_mpage_readpages(struct address_space *mapping, struct list_head *pages,
++				unsigned nr_pages, get_block_t get_block)
++{
++	struct bio *bio = NULL;
++	unsigned page_idx;
++	sector_t last_block_in_bio = 0;
++	struct buffer_head map_bh;
++	unsigned long first_logical_block = 0;
++
++	clear_buffer_mapped(&map_bh);
++	for (page_idx = 0; page_idx < nr_pages; page_idx++) {
++		struct page *page = list_entry(pages->prev, struct page, lru);
++
++		prefetchw(&page->flags);
++		list_del(&page->lru);
++		if (!add_to_page_cache_lru(page, mapping,
++					page->index, GFP_KERNEL)) {
++			bio = ext2bp_do_mpage_readpage(bio, page,
++					nr_pages - page_idx,
++					&last_block_in_bio, &map_bh,
++					&first_logical_block,
++					get_block);
++		}
++		page_cache_release(page);
++	}
++	BUG_ON(!list_empty(pages));
++	if (bio)
++		mpage_bio_submit(READ, bio);
++	return 0;
++}
++EXPORT_SYMBOL(ext2bp_mpage_readpages);
++
+ /*
+  * This isn't called much at all
+  */
+@@ -421,6 +629,25 @@
+ EXPORT_SYMBOL(mpage_readpage);
+ 
+ /*
++ * Vijay: mpage_readpage modified for ext2bp
++ */
++int ext2bp_mpage_readpage(struct page *page, get_block_t get_block)
++{
++	struct bio *bio = NULL;
++	sector_t last_block_in_bio = 0;
++	struct buffer_head map_bh;
++	unsigned long first_logical_block = 0;
++
++	clear_buffer_mapped(&map_bh);
++	bio = ext2bp_do_mpage_readpage(bio, page, 1, &last_block_in_bio,
++			&map_bh, &first_logical_block, get_block);
++	if (bio)
++		mpage_bio_submit(READ, bio);
++	return 0;
++}
++EXPORT_SYMBOL(ext2bp_mpage_readpage);
++
++/*
+  * Writing is not so simple.
+  *
+  * If the page has buffers then they will be used for obtaining the disk
+@@ -558,6 +785,228 @@
+ 		 * written out to the file."
+ 		 */
+ 		unsigned offset = i_size & (PAGE_CACHE_SIZE - 1);
++        
++        if (page->index > end_index || !offset)
++			goto confused;
++		zero_user_segment(page, offset, PAGE_CACHE_SIZE);
++	}
++
++	/*
++	 * This page will go to BIO.  Do we need to send this BIO off first?
++	 */
++	if (bio && mpd->last_block_in_bio != blocks[0] - 1)
++		bio = mpage_bio_submit(WRITE, bio);
++
++alloc_new:
++	if (bio == NULL) {
++		bio = mpage_alloc(bdev, blocks[0] << (blkbits - 9),
++				bio_get_nr_vecs(bdev), GFP_NOFS|__GFP_HIGH);
++		if (bio == NULL)
++			goto confused;
++	}
++
++	/*
++	 * Must try to add the page before marking the buffer clean or
++	 * the confused fail path above (OOM) will be very confused when
++	 * it finds all bh marked clean (i.e. it will not write anything)
++	 */
++	length = first_unmapped << blkbits;
++	if (bio_add_page(bio, page, length, 0) < length) {
++		bio = mpage_bio_submit(WRITE, bio);
++		goto alloc_new;
++	}
++
++	/*
++	 * OK, we have our BIO, so we can now mark the buffers clean.  Make
++	 * sure to only clean buffers which we know we'll be writing.
++	 */
++	if (page_has_buffers(page)) {
++		struct buffer_head *head = page_buffers(page);
++		struct buffer_head *bh = head;
++		unsigned buffer_counter = 0;
++
++		do {
++			if (buffer_counter++ == first_unmapped)
++				break;
++			clear_buffer_dirty(bh);
++			bh = bh->b_this_page;
++		} while (bh != head);
++
++		/*
++		 * we cannot drop the bh if the page is not uptodate
++		 * or a concurrent readpage would fail to serialize with the bh
++		 * and it would read from disk before we reach the platter.
++		 */
++		if (buffer_heads_over_limit && PageUptodate(page))
++			try_to_free_buffers(page);
++	}
++
++	BUG_ON(PageWriteback(page));
++	set_page_writeback(page);
++	unlock_page(page);
++	if (boundary || (first_unmapped != blocks_per_page)) {
++		bio = mpage_bio_submit(WRITE, bio);
++		if (boundary_block) {
++			write_boundary_block(boundary_bdev,
++					boundary_block, 1 << blkbits);
++		}
++	} else {
++		mpd->last_block_in_bio = blocks[blocks_per_page - 1];
++	}
++	goto out;
++
++confused:
++	if (bio)
++		bio = mpage_bio_submit(WRITE, bio);
++
++	if (mpd->use_writepage) {
++		ret = mapping->a_ops->writepage(page, wbc);
++	} else {
++		ret = -EAGAIN;
++		goto out;
++	}
++	/*
++	 * The caller has a ref on the inode, so *mapping is stable
++	 */
++	mapping_set_error(mapping, ret);
++out:
++	mpd->bio = bio;
++	return ret;
++}
++EXPORT_SYMBOL(__mpage_writepage);
++
++/* Vijay: Changed __mpage_writepage for Ext2bp. Changes include modified
++   offset calculation, and use of physical size of the file instead of 
++   the logical size */
++int __ext2bp_mpage_writepage(struct page *page, struct writeback_control *wbc,
++		      void *data)
++{
++	struct mpage_data *mpd = data;
++	struct bio *bio = mpd->bio;
++	struct address_space *mapping = page->mapping;
++	struct inode *inode = page->mapping->host;
++	const unsigned blkbits = inode->i_blkbits;
++	unsigned long end_index;
++	const unsigned blocks_per_page = PAGE_CACHE_SIZE >> blkbits;
++	sector_t last_block;
++	sector_t block_in_file;
++	sector_t blocks[MAX_BUF_PER_PAGE];
++	unsigned page_block;
++	unsigned first_unmapped = blocks_per_page;
++	struct block_device *bdev = NULL;
++	int boundary = 0;
++	sector_t boundary_block = 0;
++	struct block_device *boundary_bdev = NULL;
++	int length;
++	struct buffer_head map_bh;
++	loff_t i_size = i_size_read(inode);
++	int ret = 0;
++
++	if (page_has_buffers(page)) {
++		struct buffer_head *head = page_buffers(page);
++		struct buffer_head *bh = head;
++
++		/* If they're all mapped and dirty, do it */
++		page_block = 0;
++		do {
++			BUG_ON(buffer_locked(bh));
++			if (!buffer_mapped(bh)) {
++				/*
++				 * unmapped dirty buffers are created by
++				 * __set_page_dirty_buffers -> mmapped data
++				 */
++				if (buffer_dirty(bh))
++					goto confused;
++				if (first_unmapped == blocks_per_page)
++					first_unmapped = page_block;
++				continue;
++			}
++
++			if (first_unmapped != blocks_per_page)
++				goto confused;	/* hole -> non-hole */
++
++			if (!buffer_dirty(bh) || !buffer_uptodate(bh))
++				goto confused;
++			if (page_block) {
++				if (bh->b_blocknr != blocks[page_block-1] + 1)
++					goto confused;
++			}
++			blocks[page_block++] = bh->b_blocknr;
++			boundary = buffer_boundary(bh);
++			if (boundary) {
++				boundary_block = bh->b_blocknr;
++				boundary_bdev = bh->b_bdev;
++			}
++			bdev = bh->b_bdev;
++		} while ((bh = bh->b_this_page) != head);
++
++		if (first_unmapped)
++			goto page_is_mapped;
++
++		/*
++		 * Page has buffers, but they are all unmapped. The page was
++		 * created by pagein or read over a hole which was handled by
++		 * block_read_full_page().  If this address_space is also
++		 * using mpage_readpages then this can rarely happen.
++		 */
++		goto confused;
++	}
++
++	/*
++	 * The page has no buffers: map it to disk
++	 */
++	BUG_ON(!PageUptodate(page));
++	block_in_file = (sector_t)page->index << (PAGE_CACHE_SHIFT - blkbits);
++	last_block = ((unsigned long)i_size - 1) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	
++	map_bh.b_page = page;
++	for (page_block = 0; page_block < blocks_per_page; ) {
++
++		map_bh.b_state = 0;
++		map_bh.b_size = 1 << blkbits;
++		if (mpd->get_block(inode, block_in_file, &map_bh, 1))
++			goto confused;
++		if (buffer_new(&map_bh))
++			unmap_underlying_metadata(map_bh.b_bdev,
++						map_bh.b_blocknr);
++		if (buffer_boundary(&map_bh)) {
++			boundary_block = map_bh.b_blocknr;
++			boundary_bdev = map_bh.b_bdev;
++		}
++		if (page_block) {
++			if (map_bh.b_blocknr != blocks[page_block-1] + 1)
++				goto confused;
++		}
++		blocks[page_block++] = map_bh.b_blocknr;
++		boundary = buffer_boundary(&map_bh);
++		bdev = map_bh.b_bdev;
++		if (block_in_file == last_block)
++			break;
++		block_in_file++;
++	}
++	BUG_ON(page_block == 0);
++
++	first_unmapped = page_block;
++
++page_is_mapped:
++	end_index = (unsigned long)i_size / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	if (page->index >= end_index) {
++		/*
++		 * The page straddles i_size.  It must be zeroed out on each
++		 * and every writepage invokation because it may be mmapped.
++		 * "A file is mapped in multiples of the page size.  For a file
++		 * that is not a multiple of the page size, the remaining memory
++		 * is zeroed when mapped, and writes to that region are not
++		 * written out to the file."
++		 */
++
++		// Vijay: We need to use the physical size here. Adding total header size
++		unsigned long num_headers = 1 + (unsigned long)i_size/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++		// Subtract one if it is a perfect multiple
++		if((unsigned long)i_size%(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) == 0) num_headers--;
++		unsigned long total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++		unsigned long total_size = i_size + total_header_size;
++		unsigned offset = total_size & (PAGE_CACHE_SIZE - 1);
+ 
+ 		if (page->index > end_index || !offset)
+ 			goto confused;
+@@ -646,7 +1095,7 @@
+ 	mpd->bio = bio;
+ 	return ret;
+ }
+-EXPORT_SYMBOL(__mpage_writepage);
++EXPORT_SYMBOL(__ext2bp_mpage_writepage);
+ 
+ /**
+  * mpage_writepages - walk the list of dirty pages of the given address space & writepage() all of them
+@@ -691,6 +1140,36 @@
+ }
+ EXPORT_SYMBOL(mpage_writepages);
+ 
++/**
++ * ext2bp_mpage_writepages - Modifying mpage_writepages for ext2bp. 
++ * Author: vijayc@cs.wisc.edu
++ * Modification required: The offset calculation was wrong in __mpage_writepage.
++ * This had to be replaced wth __ext2bp_mpage_writepage.
++*/
++int
++ext2bp_mpage_writepages(struct address_space *mapping,
++		struct writeback_control *wbc, get_block_t get_block)
++{
++	int ret;
++
++	if (!get_block)
++		ret = generic_writepages(mapping, wbc);
++	else {
++		struct mpage_data mpd = {
++			.bio = NULL,
++			.last_block_in_bio = 0,
++			.get_block = get_block,
++			.use_writepage = 1,
++		};
++
++		ret = write_cache_pages(mapping, wbc, __ext2bp_mpage_writepage, &mpd);
++		if (mpd.bio)
++			mpage_bio_submit(WRITE, mpd.bio);
++	}
++	return ret;
++}
++EXPORT_SYMBOL(ext2bp_mpage_writepages);
++
+ int mpage_writepage(struct page *page, get_block_t get_block,
+ 	struct writeback_control *wbc)
+ {
+@@ -706,3 +1185,25 @@
+ 	return ret;
+ }
+ EXPORT_SYMBOL(mpage_writepage);
++
++/**
++ * ext2bp_mpage_writepage - Modifying mpage_writepage for ext2bp. 
++ * Author: vijayc@cs.wisc.edu
++ * Modification required: The offset calculation was wrong in __mpage_writepage.
++ * This had to be replaced wth __ext2bp_mpage_writepage.
++*/
++int ext2bp_mpage_writepage(struct page *page, get_block_t get_block,
++	struct writeback_control *wbc)
++{
++	struct mpage_data mpd = {
++		.bio = NULL,
++		.last_block_in_bio = 0,
++		.get_block = get_block,
++		.use_writepage = 0,
++	};
++	int ret = __ext2bp_mpage_writepage(page, wbc, &mpd);
++	if (mpd.bio)
++		mpage_bio_submit(WRITE, mpd.bio);
++	return ret;
++}
++EXPORT_SYMBOL(ext2bp_mpage_writepage);
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/include/linux/buffer_head.h linux/include/linux/buffer_head.h
+--- linux-2.6.27.55/include/linux/buffer_head.h	2010-10-28 23:04:39.000000000 -0500
++++ linux/include/linux/buffer_head.h	2012-10-13 17:14:04.000000000 -0500
+@@ -204,14 +204,24 @@
+ int block_write_full_page(struct page *page, get_block_t *get_block,
+ 				struct writeback_control *wbc);
+ int block_read_full_page(struct page*, get_block_t*);
++int ext2bp_block_read_full_page(struct page*, get_block_t*);
+ int block_is_partially_uptodate(struct page *page, read_descriptor_t *desc,
+ 				unsigned long from);
++int ext2bp_block_write_begin(struct file *, struct address_space *,
++				loff_t, unsigned, unsigned,
++				struct page **, void **, get_block_t*);
+ int block_write_begin(struct file *, struct address_space *,
+ 				loff_t, unsigned, unsigned,
+ 				struct page **, void **, get_block_t*);
+ int block_write_end(struct file *, struct address_space *,
+ 				loff_t, unsigned, unsigned,
+ 				struct page *, void *);
++int ext2bp_block_write_end(struct file *, struct address_space *,
++				loff_t, unsigned, unsigned,
++				struct page *, void *);
++int ext2bp_write_end(struct file *, struct address_space *,
++				loff_t, unsigned, unsigned,
++				struct page *, void *);
+ int generic_write_end(struct file *, struct address_space *,
+ 				loff_t, unsigned, unsigned,
+ 				struct page *, void *);
+@@ -227,6 +237,7 @@
+ void block_sync_page(struct page *);
+ sector_t generic_block_bmap(struct address_space *, sector_t, get_block_t *);
+ int block_truncate_page(struct address_space *, loff_t, get_block_t *);
++int ext2bp_block_truncate_page(struct address_space *, loff_t, get_block_t *);
+ int file_fsync(struct file *, struct dentry *, int);
+ int nobh_write_begin(struct file *, struct address_space *,
+ 				loff_t, unsigned, unsigned,
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/include/linux/ext2bp_fs.h linux/include/linux/ext2bp_fs.h
+--- linux-2.6.27.55/include/linux/ext2bp_fs.h	1969-12-31 18:00:00.000000000 -0600
++++ linux/include/linux/ext2bp_fs.h	2012-10-13 03:18:04.000000000 -0500
+@@ -0,0 +1,599 @@
++/*
++ *  linux/include/linux/ext2_fs.h
++ *
++ * Copyright (C) 1992, 1993, 1994, 1995
++ * Remy Card (card@masi.ibp.fr)
++ * Laboratoire MASI - Institut Blaise Pascal
++ * Universite Pierre et Marie Curie (Paris VI)
++ *
++ *  from
++ *
++ *  linux/include/linux/minix_fs.h
++ *
++ *  Copyright (C) 1991, 1992  Linus Torvalds
++ */
++
++/* Vijay Chidambaram (vijayc@cs.wisc.edu)
++   Making the following changes:
++	1. Adding backlinks to inode
++	2. Adding validity bitmaps to group descriptor
++*/
++
++#ifndef _LINUX_EXT2_FS_H
++#define _LINUX_EXT2_FS_H
++
++#include <linux/types.h>
++#include <linux/magic.h>
++
++/*
++ * The second extended filesystem constants/structures
++ */
++
++/*
++ * Define EXT2FS_DEBUG to produce debug messages
++ */
++#undef EXT2FS_DEBUG
++/*
++ * Define EXT2BPFS_DEBUG to produce ext2bp debug messages
++ */
++#define EXT2BPFS_DEBUG
++
++/*
++ * Define EXT2_RESERVATION to reserve data blocks for expanding files
++ */
++#define EXT2_DEFAULT_RESERVE_BLOCKS     8
++/*max window size: 1024(direct blocks) + 3([t,d]indirect blocks) */
++#define EXT2_MAX_RESERVE_BLOCKS         1027
++#define EXT2_RESERVE_WINDOW_NOT_ALLOCATED 0
++/*
++ * The second extended file system version
++ */
++#define EXT2FS_DATE		"95/08/09"
++#define EXT2FS_VERSION		"0.5b"
++
++/*
++ * Debug code
++ */
++#ifdef EXT2FS_DEBUG
++#	define ext2_debug(f, a...)	{ \
++					printk ("EXT2-fs DEBUG (%s, %d): %s:", \
++						__FILE__, __LINE__, __FUNCTION__); \
++				  	printk (f, ## a); \
++					}
++#else
++#	define ext2_debug(f, a...)	/**/
++#endif
++
++/*
++ * Ext2bp Debug code
++ */
++#ifdef EXT2BPFS_DEBUG
++#	define ext2bp_debug(f, a...)	{ \
++					printk ("EXT2bp-fs DEBUG (%s, %d): %s:", \
++						__FILE__, __LINE__, __FUNCTION__); \
++				  	printk (f, ## a); \
++					}
++#else
++#	define ext2bp_debug(f, a...)	/**/
++#endif
++
++/*
++ * Special inode numbers
++ */
++#define	EXT2_BAD_INO		 1	/* Bad blocks inode */
++#define EXT2_ROOT_INO		 2	/* Root inode */
++#define EXT2_BOOT_LOADER_INO	 5	/* Boot loader inode */
++#define EXT2_UNDEL_DIR_INO	 6	/* Undelete directory inode */
++
++/* First non-reserved inode for old ext2 filesystems */
++#define EXT2_GOOD_OLD_FIRST_INO	11
++
++#ifdef __KERNEL__
++#include <linux/ext2_fs_sb.h>
++static inline struct ext2_sb_info *EXT2_SB(struct super_block *sb)
++{
++	return sb->s_fs_info;
++}
++#else
++/* Assume that user mode programs are passing in an ext2fs superblock, not
++ * a kernel struct super_block.  This will allow us to call the feature-test
++ * macros from user land. */
++#define EXT2_SB(sb)	(sb)
++#endif
++
++/*
++ * Maximal count of links to a file
++ */
++#define EXT2_LINK_MAX		32000
++
++/*
++ * Macro-instructions used to manage several block sizes
++ */
++#define EXT2_MIN_BLOCK_SIZE		1024
++#define	EXT2_MAX_BLOCK_SIZE		4096
++#define EXT2_MIN_BLOCK_LOG_SIZE		  10
++#ifdef __KERNEL__
++# define EXT2_BLOCK_SIZE(s)		((s)->s_blocksize)
++#else
++# define EXT2_BLOCK_SIZE(s)		(EXT2_MIN_BLOCK_SIZE << (s)->s_log_block_size)
++#endif
++#define	EXT2_ADDR_PER_BLOCK(s)		(EXT2_BLOCK_SIZE(s) / sizeof (__u32))
++#ifdef __KERNEL__
++# define EXT2_BLOCK_SIZE_BITS(s)	((s)->s_blocksize_bits)
++#else
++# define EXT2_BLOCK_SIZE_BITS(s)	((s)->s_log_block_size + 10)
++#endif
++#ifdef __KERNEL__
++#define	EXT2_ADDR_PER_BLOCK_BITS(s)	(EXT2_SB(s)->s_addr_per_block_bits)
++#define EXT2_INODE_SIZE(s)		(EXT2_SB(s)->s_inode_size)
++#define EXT2_FIRST_INO(s)		(EXT2_SB(s)->s_first_ino)
++#else
++#define EXT2_INODE_SIZE(s)	(((s)->s_rev_level == EXT2_GOOD_OLD_REV) ? \
++				 EXT2_GOOD_OLD_INODE_SIZE : \
++				 (s)->s_inode_size)
++#define EXT2_FIRST_INO(s)	(((s)->s_rev_level == EXT2_GOOD_OLD_REV) ? \
++				 EXT2_GOOD_OLD_FIRST_INO : \
++				 (s)->s_first_ino)
++#endif
++
++/*
++ * Macro-instructions used to manage fragments
++ */
++#define EXT2_MIN_FRAG_SIZE		1024
++#define	EXT2_MAX_FRAG_SIZE		4096
++#define EXT2_MIN_FRAG_LOG_SIZE		  10
++#ifdef __KERNEL__
++# define EXT2_FRAG_SIZE(s)		(EXT2_SB(s)->s_frag_size)
++# define EXT2_FRAGS_PER_BLOCK(s)	(EXT2_SB(s)->s_frags_per_block)
++#else
++# define EXT2_FRAG_SIZE(s)		(EXT2_MIN_FRAG_SIZE << (s)->s_log_frag_size)
++# define EXT2_FRAGS_PER_BLOCK(s)	(EXT2_BLOCK_SIZE(s) / EXT2_FRAG_SIZE(s))
++#endif
++
++/*
++ * Structure of a blocks group descriptor
++ */
++struct ext2_group_desc
++{
++	__le32	bg_block_bitmap;	/* Blocks bitmap block */
++	__le32	bg_inode_bitmap;	/* Inodes bitmap block */
++	__le32	bg_inode_table;		/* Inodes table block */
++	__le16	bg_free_blocks_count;	/* Free blocks count */
++	__le16	bg_free_inodes_count;	/* Free inodes count */
++	__le16	bg_used_dirs_count;	/* Directories count */
++	__le16	bg_pad;
++	/* Previously, there were 3 reserved 32 bit integers here,
++	   serving as null buffers. 
++
++	   Now some of that space has been reclaimed for blocks for the 
++	   validity bitmaps. */
++	__le32	bg_valid_block_bitmap;	/* Blocks Validity bitmap block */
++	__le32	bg_valid_inode_bitmap;	/* Inodes Validity bitmap block */
++	__le32	bg_reserved[1];
++};
++
++/*
++ * Macro-instructions used to manage group descriptors
++ */
++#ifdef __KERNEL__
++# define EXT2_BLOCKS_PER_GROUP(s)	(EXT2_SB(s)->s_blocks_per_group)
++# define EXT2_DESC_PER_BLOCK(s)		(EXT2_SB(s)->s_desc_per_block)
++# define EXT2_INODES_PER_GROUP(s)	(EXT2_SB(s)->s_inodes_per_group)
++# define EXT2_DESC_PER_BLOCK_BITS(s)	(EXT2_SB(s)->s_desc_per_block_bits)
++#else
++# define EXT2_BLOCKS_PER_GROUP(s)	((s)->s_blocks_per_group)
++# define EXT2_DESC_PER_BLOCK(s)		(EXT2_BLOCK_SIZE(s) / sizeof (struct ext2_group_desc))
++# define EXT2_INODES_PER_GROUP(s)	((s)->s_inodes_per_group)
++#endif
++
++/*
++ * Constants relative to the data blocks
++ */
++#define	EXT2_NDIR_BLOCKS		12
++#define	EXT2_IND_BLOCK			EXT2_NDIR_BLOCKS
++#define	EXT2_DIND_BLOCK			(EXT2_IND_BLOCK + 1)
++#define	EXT2_TIND_BLOCK			(EXT2_DIND_BLOCK + 1)
++#define	EXT2_N_BLOCKS			(EXT2_TIND_BLOCK + 1)
++#define EXT2_N_LINKS			32
++
++/*
++ * Inode flags (GETFLAGS/SETFLAGS)
++ */
++#define	EXT2_SECRM_FL			FS_SECRM_FL	/* Secure deletion */
++#define	EXT2_UNRM_FL			FS_UNRM_FL	/* Undelete */
++#define	EXT2_COMPR_FL			FS_COMPR_FL	/* Compress file */
++#define EXT2_SYNC_FL			FS_SYNC_FL	/* Synchronous updates */
++#define EXT2_IMMUTABLE_FL		FS_IMMUTABLE_FL	/* Immutable file */
++#define EXT2_APPEND_FL			FS_APPEND_FL	/* writes to file may only append */
++#define EXT2_NODUMP_FL			FS_NODUMP_FL	/* do not dump file */
++#define EXT2_NOATIME_FL			FS_NOATIME_FL	/* do not update atime */
++/* Reserved for compression usage... */
++#define EXT2_DIRTY_FL			FS_DIRTY_FL
++#define EXT2_COMPRBLK_FL		FS_COMPRBLK_FL	/* One or more compressed clusters */
++#define EXT2_NOCOMP_FL			FS_NOCOMP_FL	/* Don't compress */
++#define EXT2_ECOMPR_FL			FS_ECOMPR_FL	/* Compression error */
++/* End compression flags --- maybe not all used */	
++#define EXT2_BTREE_FL			FS_BTREE_FL	/* btree format dir */
++#define EXT2_INDEX_FL			FS_INDEX_FL	/* hash-indexed directory */
++#define EXT2_IMAGIC_FL			FS_IMAGIC_FL	/* AFS directory */
++#define EXT2_JOURNAL_DATA_FL		FS_JOURNAL_DATA_FL /* Reserved for ext3 */
++#define EXT2_NOTAIL_FL			FS_NOTAIL_FL	/* file tail should not be merged */
++#define EXT2_DIRSYNC_FL			FS_DIRSYNC_FL	/* dirsync behaviour (directories only) */
++#define EXT2_TOPDIR_FL			FS_TOPDIR_FL	/* Top of directory hierarchies*/
++#define EXT2_RESERVED_FL		FS_RESERVED_FL	/* reserved for ext2 lib */
++
++#define EXT2_FL_USER_VISIBLE		FS_FL_USER_VISIBLE	/* User visible flags */
++#define EXT2_FL_USER_MODIFIABLE		FS_FL_USER_MODIFIABLE	/* User modifiable flags */
++
++/*
++ * ioctl commands
++ */
++#define	EXT2_IOC_GETFLAGS		FS_IOC_GETFLAGS
++#define	EXT2_IOC_SETFLAGS		FS_IOC_SETFLAGS
++#define	EXT2_IOC_GETVERSION		FS_IOC_GETVERSION
++#define	EXT2_IOC_SETVERSION		FS_IOC_SETVERSION
++#define	EXT2_IOC_GETRSVSZ		_IOR('f', 5, long)
++#define	EXT2_IOC_SETRSVSZ		_IOW('f', 6, long)
++
++/*
++ * ioctl commands in 32 bit emulation
++ */
++#define EXT2_IOC32_GETFLAGS		FS_IOC32_GETFLAGS
++#define EXT2_IOC32_SETFLAGS		FS_IOC32_SETFLAGS
++#define EXT2_IOC32_GETVERSION		FS_IOC32_GETVERSION
++#define EXT2_IOC32_SETVERSION		FS_IOC32_SETVERSION
++
++/*
++ * Structure of an inode on the disk
++ */
++struct ext2_inode {
++	__le16	i_mode;		/* File mode */
++	__le16	i_uid;		/* Low 16 bits of Owner Uid */
++	__le32	i_size;		/* Size in bytes */
++	__le32	i_atime;	/* Access time */
++	__le32	i_ctime;	/* Creation time */
++	__le32	i_mtime;	/* Modification time */
++	__le32	i_dtime;	/* Deletion Time */
++	__le16	i_gid;		/* Low 16 bits of Group Id */
++	__le16	i_links_count;	/* Links count */
++	__le32	i_blocks;	/* Blocks count */
++	__le32	i_flags;	/* File flags */
++	union {
++		struct {
++			__le32  l_i_reserved1;
++		} linux1;
++		struct {
++			__le32  h_i_translator;
++		} hurd1;
++		struct {
++			__le32  m_i_reserved1;
++		} masix1;
++	} osd1;				/* OS dependent 1 */
++	__le32	i_block[EXT2_N_BLOCKS];/* Pointers to blocks */
++	__le32	i_generation;	/* File version (for NFS) */
++	__le32	i_file_acl;	/* File ACL */
++	__le32	i_dir_acl;	/* Directory ACL */
++	__le32	i_faddr;	/* Fragment address */
++	union {
++		struct {
++			__u8	l_i_frag;	/* Fragment number */
++			__u8	l_i_fsize;	/* Fragment size */
++			__u16	i_pad1;
++			__le16	l_i_uid_high;	/* these 2 fields    */
++			__le16	l_i_gid_high;	/* were reserved2[0] */
++			__u32	l_i_reserved2;
++		} linux2;
++		struct {
++			__u8	h_i_frag;	/* Fragment number */
++			__u8	h_i_fsize;	/* Fragment size */
++			__le16	h_i_mode_high;
++			__le16	h_i_uid_high;
++			__le16	h_i_gid_high;
++			__le32	h_i_author;
++		} hurd2;
++		struct {
++			__u8	m_i_frag;	/* Fragment number */
++			__u8	m_i_fsize;	/* Fragment size */
++			__u16	m_pad1;
++			__u32	m_i_reserved2[2];
++		} masix2;
++	} osd2;				/* OS dependent 2 */
++	__u32 i_backlinks[EXT2_N_LINKS]; /* Backpointers to inodes of directories
++					    pointing to this inode */
++};
++
++#define i_size_high	i_dir_acl
++
++#if defined(__KERNEL__) || defined(__linux__)
++#define i_reserved1	osd1.linux1.l_i_reserved1
++#define i_frag		osd2.linux2.l_i_frag
++#define i_fsize		osd2.linux2.l_i_fsize
++#define i_uid_low	i_uid
++#define i_gid_low	i_gid
++#define i_uid_high	osd2.linux2.l_i_uid_high
++#define i_gid_high	osd2.linux2.l_i_gid_high
++#define i_reserved2	osd2.linux2.l_i_reserved2
++#endif
++
++#ifdef	__hurd__
++#define i_translator	osd1.hurd1.h_i_translator
++#define i_frag		osd2.hurd2.h_i_frag
++#define i_fsize		osd2.hurd2.h_i_fsize
++#define i_uid_high	osd2.hurd2.h_i_uid_high
++#define i_gid_high	osd2.hurd2.h_i_gid_high
++#define i_author	osd2.hurd2.h_i_author
++#endif
++
++#ifdef	__masix__
++#define i_reserved1	osd1.masix1.m_i_reserved1
++#define i_frag		osd2.masix2.m_i_frag
++#define i_fsize		osd2.masix2.m_i_fsize
++#define i_reserved2	osd2.masix2.m_i_reserved2
++#endif
++
++/*
++ * File system states
++ */
++#define	EXT2_VALID_FS			0x0001	/* Unmounted cleanly */
++#define	EXT2_ERROR_FS			0x0002	/* Errors detected */
++
++/*
++ * Mount flags
++ */
++#define EXT2_MOUNT_CHECK		0x000001  /* Do mount-time checks */
++#define EXT2_MOUNT_OLDALLOC		0x000002  /* Don't use the new Orlov allocator */
++#define EXT2_MOUNT_GRPID		0x000004  /* Create files with directory's group */
++#define EXT2_MOUNT_DEBUG		0x000008  /* Some debugging messages */
++#define EXT2_MOUNT_ERRORS_CONT		0x000010  /* Continue on errors */
++#define EXT2_MOUNT_ERRORS_RO		0x000020  /* Remount fs ro on errors */
++#define EXT2_MOUNT_ERRORS_PANIC		0x000040  /* Panic on errors */
++#define EXT2_MOUNT_MINIX_DF		0x000080  /* Mimics the Minix statfs */
++#define EXT2_MOUNT_NOBH			0x000100  /* No buffer_heads */
++#define EXT2_MOUNT_NO_UID32		0x000200  /* Disable 32-bit UIDs */
++#define EXT2_MOUNT_XATTR_USER		0x004000  /* Extended user attributes */
++#define EXT2_MOUNT_POSIX_ACL		0x008000  /* POSIX Access Control Lists */
++#define EXT2_MOUNT_XIP			0x010000  /* Execute in place */
++#define EXT2_MOUNT_USRQUOTA		0x020000  /* user quota */
++#define EXT2_MOUNT_GRPQUOTA		0x040000  /* group quota */
++#define EXT2_MOUNT_RESERVATION		0x080000  /* Preallocation */
++
++
++#define clear_opt(o, opt)		o &= ~EXT2_MOUNT_##opt
++#define set_opt(o, opt)			o |= EXT2_MOUNT_##opt
++#define test_opt(sb, opt)		(EXT2_SB(sb)->s_mount_opt & \
++					 EXT2_MOUNT_##opt)
++/*
++ * Maximal mount counts between two filesystem checks
++ */
++#define EXT2_DFL_MAX_MNT_COUNT		20	/* Allow 20 mounts */
++#define EXT2_DFL_CHECKINTERVAL		0	/* Don't use interval check */
++
++/*
++ * Behaviour when detecting errors
++ */
++#define EXT2_ERRORS_CONTINUE		1	/* Continue execution */
++#define EXT2_ERRORS_RO			2	/* Remount fs read-only */
++#define EXT2_ERRORS_PANIC		3	/* Panic */
++#define EXT2_ERRORS_DEFAULT		EXT2_ERRORS_CONTINUE
++
++/*
++ * Structure of the super block
++ */
++struct ext2_super_block {
++	__le32	s_inodes_count;		/* Inodes count */
++	__le32	s_blocks_count;		/* Blocks count */
++	__le32	s_r_blocks_count;	/* Reserved blocks count */
++	__le32	s_free_blocks_count;	/* Free blocks count */
++	__le32	s_free_inodes_count;	/* Free inodes count */
++	__le32	s_first_data_block;	/* First Data Block */
++	__le32	s_log_block_size;	/* Block size */
++	__le32	s_log_frag_size;	/* Fragment size */
++	__le32	s_blocks_per_group;	/* # Blocks per group */
++	__le32	s_frags_per_group;	/* # Fragments per group */
++	__le32	s_inodes_per_group;	/* # Inodes per group */
++	__le32	s_mtime;		/* Mount time */
++	__le32	s_wtime;		/* Write time */
++	__le16	s_mnt_count;		/* Mount count */
++	__le16	s_max_mnt_count;	/* Maximal mount count */
++	__le16	s_magic;		/* Magic signature */
++	__le16	s_state;		/* File system state */
++	__le16	s_errors;		/* Behaviour when detecting errors */
++	__le16	s_minor_rev_level; 	/* minor revision level */
++	__le32	s_lastcheck;		/* time of last check */
++	__le32	s_checkinterval;	/* max. time between checks */
++	__le32	s_creator_os;		/* OS */
++	__le32	s_rev_level;		/* Revision level */
++	__le16	s_def_resuid;		/* Default uid for reserved blocks */
++	__le16	s_def_resgid;		/* Default gid for reserved blocks */
++	/*
++	 * These fields are for EXT2_DYNAMIC_REV superblocks only.
++	 *
++	 * Note: the difference between the compatible feature set and
++	 * the incompatible feature set is that if there is a bit set
++	 * in the incompatible feature set that the kernel doesn't
++	 * know about, it should refuse to mount the filesystem.
++	 * 
++	 * e2fsck's requirements are more strict; if it doesn't know
++	 * about a feature in either the compatible or incompatible
++	 * feature set, it must abort and not try to meddle with
++	 * things it doesn't understand...
++	 */
++	__le32	s_first_ino; 		/* First non-reserved inode */
++	__le16   s_inode_size; 		/* size of inode structure */
++	__le16	s_block_group_nr; 	/* block group # of this superblock */
++	__le32	s_feature_compat; 	/* compatible feature set */
++	__le32	s_feature_incompat; 	/* incompatible feature set */
++	__le32	s_feature_ro_compat; 	/* readonly-compatible feature set */
++	__u8	s_uuid[16];		/* 128-bit uuid for volume */
++	char	s_volume_name[16]; 	/* volume name */
++	char	s_last_mounted[64]; 	/* directory where last mounted */
++	__le32	s_algorithm_usage_bitmap; /* For compression */
++	/*
++	 * Performance hints.  Directory preallocation should only
++	 * happen if the EXT2_COMPAT_PREALLOC flag is on.
++	 */
++	__u8	s_prealloc_blocks;	/* Nr of blocks to try to preallocate*/
++	__u8	s_prealloc_dir_blocks;	/* Nr to preallocate for dirs */
++	__u16	s_padding1;
++	/*
++	 * Journaling support valid if EXT3_FEATURE_COMPAT_HAS_JOURNAL set.
++	 */
++	__u8	s_journal_uuid[16];	/* uuid of journal superblock */
++	__u32	s_journal_inum;		/* inode number of journal file */
++	__u32	s_journal_dev;		/* device number of journal file */
++	__u32	s_last_orphan;		/* start of list of inodes to delete */
++	__u32	s_hash_seed[4];		/* HTREE hash seed */
++	__u8	s_def_hash_version;	/* Default hash version to use */
++	__u8	s_reserved_char_pad;
++	__u16	s_reserved_word_pad;
++	__le32	s_default_mount_opts;
++ 	__le32	s_first_meta_bg; 	/* First metablock block group */
++	__u32	s_reserved[190];	/* Padding to the end of the block */
++};
++
++/*
++ * Codes for operating systems
++ */
++#define EXT2_OS_LINUX		0
++#define EXT2_OS_HURD		1
++#define EXT2_OS_MASIX		2
++#define EXT2_OS_FREEBSD		3
++#define EXT2_OS_LITES		4
++
++/*
++ * Revision levels
++ */
++#define EXT2_GOOD_OLD_REV	0	/* The good old (original) format */
++#define EXT2_DYNAMIC_REV	1 	/* V2 format w/ dynamic inode sizes */
++
++#define EXT2_CURRENT_REV	EXT2_GOOD_OLD_REV
++#define EXT2_MAX_SUPP_REV	EXT2_DYNAMIC_REV
++
++#define EXT2_GOOD_OLD_INODE_SIZE 256
++
++/*
++ * Feature set definitions
++ */
++
++#define EXT2_HAS_COMPAT_FEATURE(sb,mask)			\
++	( EXT2_SB(sb)->s_es->s_feature_compat & cpu_to_le32(mask) )
++#define EXT2_HAS_RO_COMPAT_FEATURE(sb,mask)			\
++	( EXT2_SB(sb)->s_es->s_feature_ro_compat & cpu_to_le32(mask) )
++#define EXT2_HAS_INCOMPAT_FEATURE(sb,mask)			\
++	( EXT2_SB(sb)->s_es->s_feature_incompat & cpu_to_le32(mask) )
++#define EXT2_SET_COMPAT_FEATURE(sb,mask)			\
++	EXT2_SB(sb)->s_es->s_feature_compat |= cpu_to_le32(mask)
++#define EXT2_SET_RO_COMPAT_FEATURE(sb,mask)			\
++	EXT2_SB(sb)->s_es->s_feature_ro_compat |= cpu_to_le32(mask)
++#define EXT2_SET_INCOMPAT_FEATURE(sb,mask)			\
++	EXT2_SB(sb)->s_es->s_feature_incompat |= cpu_to_le32(mask)
++#define EXT2_CLEAR_COMPAT_FEATURE(sb,mask)			\
++	EXT2_SB(sb)->s_es->s_feature_compat &= ~cpu_to_le32(mask)
++#define EXT2_CLEAR_RO_COMPAT_FEATURE(sb,mask)			\
++	EXT2_SB(sb)->s_es->s_feature_ro_compat &= ~cpu_to_le32(mask)
++#define EXT2_CLEAR_INCOMPAT_FEATURE(sb,mask)			\
++	EXT2_SB(sb)->s_es->s_feature_incompat &= ~cpu_to_le32(mask)
++
++#define EXT2_FEATURE_COMPAT_DIR_PREALLOC	0x0001
++#define EXT2_FEATURE_COMPAT_IMAGIC_INODES	0x0002
++#define EXT3_FEATURE_COMPAT_HAS_JOURNAL		0x0004
++#define EXT2_FEATURE_COMPAT_EXT_ATTR		0x0008
++#define EXT2_FEATURE_COMPAT_RESIZE_INO		0x0010
++#define EXT2_FEATURE_COMPAT_DIR_INDEX		0x0020
++#define EXT2_FEATURE_COMPAT_ANY			0xffffffff
++
++#define EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER	0x0001
++#define EXT2_FEATURE_RO_COMPAT_LARGE_FILE	0x0002
++#define EXT2_FEATURE_RO_COMPAT_BTREE_DIR	0x0004
++#define EXT2_FEATURE_RO_COMPAT_ANY		0xffffffff
++
++#define EXT2_FEATURE_INCOMPAT_COMPRESSION	0x0001
++#define EXT2_FEATURE_INCOMPAT_FILETYPE		0x0002
++#define EXT3_FEATURE_INCOMPAT_RECOVER		0x0004
++#define EXT3_FEATURE_INCOMPAT_JOURNAL_DEV	0x0008
++#define EXT2_FEATURE_INCOMPAT_META_BG		0x0010
++#define EXT2_FEATURE_INCOMPAT_ANY		0xffffffff
++
++#define EXT2_FEATURE_COMPAT_SUPP	EXT2_FEATURE_COMPAT_EXT_ATTR
++#define EXT2_FEATURE_INCOMPAT_SUPP	(EXT2_FEATURE_INCOMPAT_FILETYPE| \
++					 EXT2_FEATURE_INCOMPAT_META_BG)
++#define EXT2_FEATURE_RO_COMPAT_SUPP	(EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER| \
++					 EXT2_FEATURE_RO_COMPAT_LARGE_FILE| \
++					 EXT2_FEATURE_RO_COMPAT_BTREE_DIR)
++#define EXT2_FEATURE_RO_COMPAT_UNSUPPORTED	~EXT2_FEATURE_RO_COMPAT_SUPP
++#define EXT2_FEATURE_INCOMPAT_UNSUPPORTED	~EXT2_FEATURE_INCOMPAT_SUPP
++
++/*
++ * Default values for user and/or group using reserved blocks
++ */
++#define	EXT2_DEF_RESUID		0
++#define	EXT2_DEF_RESGID		0
++
++/*
++ * Default mount options
++ */
++#define EXT2_DEFM_DEBUG		0x0001
++#define EXT2_DEFM_BSDGROUPS	0x0002
++#define EXT2_DEFM_XATTR_USER	0x0004
++#define EXT2_DEFM_ACL		0x0008
++#define EXT2_DEFM_UID16		0x0010
++    /* Not used by ext2, but reserved for use by ext3 */
++#define EXT3_DEFM_JMODE		0x0060 
++#define EXT3_DEFM_JMODE_DATA	0x0020
++#define EXT3_DEFM_JMODE_ORDERED	0x0040
++#define EXT3_DEFM_JMODE_WBACK	0x0060
++
++/*
++ * Structure of a directory entry
++ */
++#define EXT2_NAME_LEN 255
++
++struct ext2_dir_entry {
++	__le32	inode;			/* Inode number */
++	__le16	rec_len;		/* Directory entry length */
++	__le16	name_len;		/* Name length */
++	char	name[EXT2_NAME_LEN];	/* File name */
++};
++
++/*
++ * The new version of the directory entry.  Since EXT2 structures are
++ * stored in intel byte order, and the name_len field could never be
++ * bigger than 255 chars, it's safe to reclaim the extra byte for the
++ * file_type field.
++ */
++struct ext2_dir_entry_2 {
++	__le32	inode;			/* Inode number */
++	__le16	rec_len;		/* Directory entry length */
++	__u8	name_len;		/* Name length */
++	__u8	file_type;
++	char	name[EXT2_NAME_LEN];	/* File name */
++};
++
++/*
++ * Ext2 directory file types.  Only the low 3 bits are used.  The
++ * other bits are reserved for now.
++ */
++enum {
++	EXT2_FT_UNKNOWN,
++	EXT2_FT_REG_FILE,
++	EXT2_FT_DIR,
++	EXT2_FT_CHRDEV,
++	EXT2_FT_BLKDEV,
++	EXT2_FT_FIFO,
++	EXT2_FT_SOCK,
++	EXT2_FT_SYMLINK,
++	EXT2_FT_MAX
++};
++
++/*
++ * EXT2_DIR_PAD defines the directory entries boundaries
++ *
++ * NOTE: It must be a multiple of 4
++ */
++#define EXT2_DIR_PAD		 	4
++#define EXT2_DIR_ROUND 			(EXT2_DIR_PAD - 1)
++#define EXT2_DIR_REC_LEN(name_len)	(((name_len) + 8 + EXT2_DIR_ROUND) & \
++					 ~EXT2_DIR_ROUND)
++#define EXT2_MAX_REC_LEN		((1<<16)-1)
++
++#endif	/* _LINUX_EXT2_FS_H */
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/include/linux/ext2_fs_sb.h linux/include/linux/ext2_fs_sb.h
+--- linux-2.6.27.55/include/linux/ext2_fs_sb.h	2010-10-28 23:04:39.000000000 -0500
++++ linux/include/linux/ext2_fs_sb.h	2012-10-13 03:18:04.000000000 -0500
+@@ -106,6 +106,23 @@
+ 	spinlock_t s_rsv_window_lock;
+ 	struct rb_root s_rsv_window_root;
+ 	struct ext2_reserve_window_node s_rsv_window_head;
++
++	/* Vijay: Adding char* pointers for validity and free bitmaps.
++	   These should be for both inodes and blocks. 
++	   Eventually I might need to add a spinlock in here */
++	char* s_inode_validity_bitmap;
++	char* s_inode_availability_bitmap;
++	char* s_block_validity_bitmap;
++	char* s_block_availability_bitmap;
++	/* Vijay: Number of bytes needed for the bitmap for the inodes of 1 group */
++	unsigned int s_inodes_per_group_bitmap_size;
++	/* Vijay: Number of bytes needed for the bitmap for the blocks of 1 group */
++	unsigned int s_blocks_per_group_bitmap_size;
++	/* Vijay: including fields from the group desc */
++	__le32 *bg_inode_tables;
++	unsigned long *bg_free_inodes_counts;
++	unsigned long *bg_free_blocks_counts;
++	unsigned long *bg_used_dirs_counts;	
+ };
+ 
+ #endif	/* _LINUX_EXT2_FS_SB */
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/include/linux/fs.h linux/include/linux/fs.h
+--- linux-2.6.27.55/include/linux/fs.h	2010-10-28 23:04:39.000000000 -0500
++++ linux/include/linux/fs.h	2012-10-13 03:18:04.000000000 -0500
+@@ -276,6 +276,7 @@
+ #define SYNC_FILE_RANGE_WAIT_BEFORE	1
+ #define SYNC_FILE_RANGE_WRITE		2
+ #define SYNC_FILE_RANGE_WAIT_AFTER	4
++#define EXT2BP_HEADER_SIZE		8
+ 
+ #ifdef __KERNEL__
+ 
+@@ -1867,15 +1868,20 @@
+ extern int sb_has_dirty_inodes(struct super_block *);
+ 
+ extern int generic_file_mmap(struct file *, struct vm_area_struct *);
++extern int ext2bp_file_mmap(struct file *, struct vm_area_struct *);
+ extern int generic_file_readonly_mmap(struct file *, struct vm_area_struct *);
+ extern int file_read_actor(read_descriptor_t * desc, struct page *page, unsigned long offset, unsigned long size);
+ int generic_write_checks(struct file *file, loff_t *pos, size_t *count, int isblk);
++extern ssize_t ext2bp_file_aio_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ extern ssize_t generic_file_aio_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
++extern ssize_t ext2bp_file_aio_write(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ extern ssize_t generic_file_aio_write(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ extern ssize_t generic_file_aio_write_nolock(struct kiocb *, const struct iovec *,
+ 		unsigned long, loff_t);
+ extern ssize_t generic_file_direct_write(struct kiocb *, const struct iovec *,
+ 		unsigned long *, loff_t, loff_t *, size_t, size_t);
++extern ssize_t ext2bp_file_buffered_write(struct kiocb *, const struct iovec *,
++		unsigned long, loff_t, loff_t *, size_t, ssize_t);
+ extern ssize_t generic_file_buffered_write(struct kiocb *, const struct iovec *,
+ 		unsigned long, loff_t, loff_t *, size_t, ssize_t);
+ extern ssize_t do_sync_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos);
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/include/linux/mm.h linux/include/linux/mm.h
+--- linux-2.6.27.55/include/linux/mm.h	2010-10-28 23:04:39.000000000 -0500
++++ linux/include/linux/mm.h	2012-10-13 03:18:04.000000000 -0500
+@@ -1152,6 +1152,10 @@
+ extern void truncate_inode_pages(struct address_space *, loff_t);
+ extern void truncate_inode_pages_range(struct address_space *,
+ 				       loff_t lstart, loff_t lend);
++/* Vijay: Modified functions for ext2bp */
++extern void ext2bp_truncate_inode_pages_range(struct address_space *,
++				       loff_t lstart, loff_t lend);
++extern void ext2bp_truncate_inode_pages(struct address_space *, loff_t);
+ 
+ /* generic vm_area_ops exported for stackable file systems */
+ extern int filemap_fault(struct vm_area_struct *, struct vm_fault *);
+@@ -1183,6 +1187,14 @@
+ 
+ unsigned long max_sane_readahead(unsigned long nr);
+ 
++/* Modified functions for ext2bp */
++void ext2bp_page_cache_async_readahead(struct address_space *mapping,
++				struct file_ra_state *ra,
++				struct file *filp,
++				struct page *pg,
++				pgoff_t offset,
++				unsigned long size);
++
+ /* Do stack extension */
+ extern int expand_stack(struct vm_area_struct *vma, unsigned long address);
+ #if VM_GROWSUP
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/include/linux/mpage.h linux/include/linux/mpage.h
+--- linux-2.6.27.55/include/linux/mpage.h	2010-10-28 23:04:39.000000000 -0500
++++ linux/include/linux/mpage.h	2012-10-13 03:18:04.000000000 -0500
+@@ -31,4 +31,14 @@
+ int mpage_writepage(struct page *page, get_block_t *get_block,
+ 		struct writeback_control *wbc);
+ 
++/* Vijay: Modified copies of functions for ext2bp */
++int __ext2bp_mpage_writepage(struct page *page, struct writeback_control *wbc,
++		      void *data);
++int ext2bp_mpage_writepages(struct address_space *mapping,
++		struct writeback_control *wbc, get_block_t get_block);
++int ext2bp_mpage_writepage(struct page *page, get_block_t *get_block,
++		struct writeback_control *wbc);
++int ext2bp_mpage_readpage(struct page *page, get_block_t get_block);
++int ext2bp_mpage_readpages(struct address_space *mapping, struct list_head *pages,
++				unsigned nr_pages, get_block_t get_block);
+ #endif
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/mm/filemap.c linux/mm/filemap.c
+--- linux-2.6.27.55/mm/filemap.c	2010-10-28 23:04:39.000000000 -0500
++++ linux/mm/filemap.c	2012-10-13 17:45:43.000000000 -0500
+@@ -970,6 +970,300 @@
+ }
+ 
+ /**
++ * do_ext2bp_file_read - generic file read routine
++ * @filp:	the file to read
++ * @ppos:	current file position
++ * @desc:	read_descriptor
++ * @actor:	read method
++ *
++ * This is a generic file read routine, and uses the
++ * mapping->a_ops->readpage() function for the actual low-level stuff.
++ *
++ * This is really ugly. But the goto's actually try to clarify some
++ * of the logic when it comes to error handling etc.
++ *  
++ * Author: Vijay C and Tushar Sharma
++ */
++static void do_ext2bp_file_read(struct file *filp, loff_t *ppos,
++		read_descriptor_t *desc, read_actor_t actor)
++{
++	struct address_space *mapping = filp->f_mapping;
++	struct inode *inode = mapping->host;
++	struct file_ra_state *ra = &filp->f_ra;
++	pgoff_t index;
++	pgoff_t last_index;
++	pgoff_t prev_index;
++	unsigned long offset;      /* offset into pagecache page */
++	unsigned int prev_offset;
++	int error;
++
++	index = ( (unsigned long) (*ppos)) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	prev_index = ( (unsigned long) ra->prev_pos) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	prev_offset = ( (unsigned long)  ra->prev_pos) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	last_index = ( (unsigned long) (*ppos + desc->count + PAGE_CACHE_SIZE -EXT2BP_HEADER_SIZE -1)) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	offset = ( ((unsigned long)(*ppos)) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE)) + EXT2BP_HEADER_SIZE;
++		
++	for (;;) {
++		struct page *page;
++		pgoff_t end_index;
++		loff_t isize;
++		unsigned long nr, ret;
++
++		cond_resched();
++find_page:
++		page = find_get_page(mapping, index);
++		if (!page) {
++			page_cache_sync_readahead(mapping,
++					ra, filp,
++					index, last_index - index);
++			page = find_get_page(mapping, index);
++			if (unlikely(page == NULL))
++				goto no_cached_page;
++		}
++		if (PageReadahead(page)) {
++			ext2bp_page_cache_async_readahead(mapping,
++					ra, filp, page,
++					index, last_index - index);
++		}
++		if (!PageUptodate(page)) {
++			if (inode->i_blkbits == PAGE_CACHE_SHIFT ||
++					!mapping->a_ops->is_partially_uptodate)
++				goto page_not_up_to_date;
++			if (!trylock_page(page))
++				goto page_not_up_to_date;
++			if (!mapping->a_ops->is_partially_uptodate(page,
++								desc, offset))
++				goto page_not_up_to_date_locked;
++			unlock_page(page);
++		}
++page_ok:
++		/*
++		 * i_size must be checked after we know the page is Uptodate.
++		 *
++		 * Checking i_size after the check allows us to calculate
++		 * the correct value for "nr", which means the zero-filled
++		 * part of the page is not copied back to userspace (unless
++		 * another truncate extends the file - this is desired though).
++		 */
++
++		isize = i_size_read(inode);
++		end_index = ( (unsigned long) (isize - 1)) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	
++		if (unlikely(!isize || index > end_index)) {
++			page_cache_release(page);
++			goto out;
++		}
++
++		/* nr is the maximum number of bytes to copy from this page */
++		nr = PAGE_CACHE_SIZE;
++		if (index == end_index) {
++			/* Here, we are dealing with the _physical_ size of the 
++			   file. However, isize returns the logical size of the
++			   file. Hence we need to add the header size to the 
++			   isize. */
++			unsigned long vsize = i_size_read(inode);
++			unsigned long num_headers = 1 + vsize/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++			// Subtract one if it is a perfect multiple
++			if(vsize%(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) == 0) num_headers--;
++			unsigned long total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++			vsize += total_header_size;
++
++			nr = ((vsize - 1) & ~PAGE_CACHE_MASK) + 1;
++			if (nr <= offset) {
++				page_cache_release(page);
++				if(offset >= EXT2BP_HEADER_SIZE) offset = offset - EXT2BP_HEADER_SIZE;
++				prev_offset = offset;
++				goto out;
++			}
++		}
++		nr = nr - offset;
++
++		/* If users can be writing to this page using arbitrary
++		 * virtual addresses, take care about potential aliasing
++		 * before reading the page on the kernel side.
++		 */
++		if (mapping_writably_mapped(mapping))
++			flush_dcache_page(page);
++
++		/*
++		 * When a sequential read accesses a page several times,
++		 * only mark it as accessed the first time.
++		 */
++		if (prev_index != index || offset != prev_offset)
++			mark_page_accessed(page);
++		prev_index = index;
++
++		/*
++		 * Ok, we have the page, and it's up-to-date, so
++		 * now we can copy it to user space...
++		 *
++		 * The actor routine returns how many bytes were actually used..
++		 * NOTE! This may not be the same as how much of a user buffer
++		 * we filled up (we may be padding etc), so we can only update
++		 * "pos" here (the actor routine has to update the user buffer
++		 * pointers and the remaining count).
++		 */
++
++		/* Vijay: Now that we have the page, we can do the check on
++		   the page. Accessing the first bytes of the page to check 
++                   that we are reading the correct thing */
++
++		void* pageaddr = kmap(page);
++		unsigned long long cal_inode_num = 0;
++		unsigned long long exp = 1;
++		int i;		
++		for(i = 0; i < EXT2BP_HEADER_SIZE; i++) {
++			unsigned char* n = (unsigned char*)(pageaddr + i);
++			unsigned long long value = *n;
++			value = value*exp;
++			if(value > 0) cal_inode_num += value;
++			exp*=256;
++		} 	
++		kunmap(page);
++
++		if(cal_inode_num != inode->i_ino) {
++			error = -EIO;
++			goto readpage_error;
++		}
++
++		/* Vijay: End of modification */
++
++		BUG_ON(offset < EXT2BP_HEADER_SIZE);
++
++		ret = actor(desc, page, offset, nr);
++		// Vijay: Changing code to reflect the new blocksize in ext2bp
++		// At this point, offset becomes 8 + whatever chars we read.
++		offset += ret;
++
++		/* We increment the index if we have read enough bytes to go into the next page.
++		 * Currently, I was using offsets / 4088 to check this. This is wrong because
++		 * when offset == 4088, we still have 8 bytes to read on that page, but we are
++		 * skipping to the next page anyway. 
++		 */	
++		if (offset >= PAGE_CACHE_SIZE) /* If we have read everything on this page */
++			index++;		
++
++		//index += ( (unsigned long) offset) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++		offset &= ~PAGE_CACHE_MASK;
++	
++		prev_offset = offset;
++		
++		page_cache_release(page);
++		if (ret == nr && desc->count) {
++			offset += EXT2BP_HEADER_SIZE;
++			prev_offset = offset;
++			continue;
++		}
++		
++		// We are going to exit this function. We need to subtract EXT2BP_HEADER_SIZE,
++		// since this function will add that in when we re-enter it.
++		if(offset >= EXT2BP_HEADER_SIZE) offset = offset - EXT2BP_HEADER_SIZE;
++		prev_offset = offset;
++		goto out;
++
++page_not_up_to_date:
++		/* Get exclusive access to the page ... */
++		if (lock_page_killable(page))
++			goto readpage_eio;
++
++page_not_up_to_date_locked:
++		/* Did it get truncated before we got the lock? */
++		if (!page->mapping) {
++			unlock_page(page);
++			page_cache_release(page);
++			continue;
++		}
++
++		/* Did somebody else fill it already? */
++		if (PageUptodate(page)) {
++			unlock_page(page);
++			goto page_ok;
++		}
++
++readpage:
++		/*
++		 * A previous I/O error may have been due to temporary
++		 * failures, eg. multipath errors.
++		 * PG_error will be set again if readpage fails.
++		 */
++		ClearPageError(page);
++
++		/* Start the actual read. The read will unlock the page. */
++		error = mapping->a_ops->readpage(filp, page);
++
++		if (unlikely(error)) {
++			if (error == AOP_TRUNCATED_PAGE) {
++				page_cache_release(page);
++				goto find_page;
++			}
++			goto readpage_error;
++		}
++
++		if (!PageUptodate(page)) {
++			if (lock_page_killable(page))
++				goto readpage_eio;
++			if (!PageUptodate(page)) {
++				if (page->mapping == NULL) {
++					/*
++					 * invalidate_inode_pages got it
++					 */
++					unlock_page(page);
++					page_cache_release(page);
++					goto find_page;
++				}
++				unlock_page(page);
++				shrink_readahead_size_eio(filp, ra);
++				goto readpage_eio;
++			}
++			unlock_page(page);
++		}
++
++		goto page_ok;
++
++readpage_eio:
++		error = -EIO;
++readpage_error:
++		/* UHHUH! A synchronous read error occurred. Report it */
++		desc->error = error;
++		page_cache_release(page);
++		goto out;
++
++no_cached_page:
++		/*
++		 * Ok, it wasn't cached, so we need to create a new
++		 * page..
++		 */
++		page = page_cache_alloc_cold(mapping);
++		if (!page) {
++			desc->error = -ENOMEM;
++			goto out;
++		}
++		error = add_to_page_cache_lru(page, mapping,
++						index, GFP_KERNEL);
++		if (error) {
++			page_cache_release(page);
++			if (error == -EEXIST)
++				goto find_page;
++			desc->error = error;
++			goto out;
++		}
++		goto readpage;
++	}
++
++out:
++	ra->prev_pos = prev_index;
++	// ra->prev_pos <<= PAGE_CACHE_SHIFT;
++	ra->prev_pos *= (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	// ra->prev_pos |= prev_offset;
++	ra->prev_pos += prev_offset;
++	*ppos = ((loff_t)index * (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE));
++	*ppos = *ppos + offset;
++	
++	if (filp)
++		file_accessed(filp);
++}
++
++/**
+  * do_generic_file_read - generic file read routine
+  * @filp:	the file to read
+  * @ppos:	current file position
+@@ -982,6 +1276,7 @@
+  * This is really ugly. But the goto's actually try to clarify some
+  * of the logic when it comes to error handling etc.
+  */
++
+ static void do_generic_file_read(struct file *filp, loff_t *ppos,
+ 		read_descriptor_t *desc, read_actor_t actor)
+ {
+@@ -1234,6 +1529,44 @@
+ 	return size;
+ }
+ 
++int ext2bp_file_read_actor(read_descriptor_t *desc, struct page *page,
++			unsigned long offset, unsigned long size)
++{
++	char *kaddr;
++	unsigned long left, count = desc->count;
++
++	if (size > count)
++		size = count;
++
++	/*
++	 * Faults on the destination of a read are common, so do it before
++	 * taking the kmap.
++	 */
++	if (!fault_in_pages_writeable(desc->arg.buf, size)) {
++		kaddr = kmap_atomic(page, KM_USER0);
++		left = __copy_to_user_inatomic(desc->arg.buf,
++						kaddr + offset, size);
++		kunmap_atomic(kaddr, KM_USER0);
++		if (left == 0)
++			goto success;
++	}
++
++	/* Do it the slow way */
++	kaddr = kmap(page);
++	left = __copy_to_user(desc->arg.buf, kaddr + offset, size);
++	kunmap(page);
++
++	if (left) {
++		size -= left;
++		desc->error = -EFAULT;
++	}
++success:
++	desc->count = count - size;
++	desc->written += size;
++	desc->arg.buf += size;
++	return size;
++}
++
+ /*
+  * Performs necessary checks before doing a write
+  * @iov:	io vector request
+@@ -1348,6 +1681,91 @@
+ }
+ EXPORT_SYMBOL(generic_file_aio_read);
+ 
++/**
++ * ext2bp_file_aio_read - generic filesystem read routine
++ * @iocb:	kernel I/O control block
++ * @iov:	io vector request
++ * @nr_segs:	number of segments in the iovec
++ * @pos:	current file position
++ *
++ * This is the "read()" routine for the ext2 filesystems
++ * that can use the page cache directly.
++ *
++ * Authors: Tushar and Vijay
++ */
++
++/* Vijay: This might be a problem. The iov that comes into the 
++   ext2bp read function has the iov in terms of 4096 bytes. 
++   However, now the maximum that can be read from a page is 4088 
++   bytes. Currently, this works, but with more iteration of the 
++   for loop. But this might cause a problem later on 
++*/
++ssize_t
++ext2bp_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
++		unsigned long nr_segs, loff_t pos)
++{
++	struct file *filp = iocb->ki_filp;
++	ssize_t retval;
++	unsigned long seg;
++	size_t count;
++	loff_t *ppos = &iocb->ki_pos;
++
++	count = 0;
++	retval = generic_segment_checks(iov, &nr_segs, &count, VERIFY_WRITE);
++	if (retval)
++		return retval;
++
++	/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
++	if (filp->f_flags & O_DIRECT) {
++
++		loff_t size;
++		struct address_space *mapping;
++		struct inode *inode;
++
++		mapping = filp->f_mapping;
++		inode = mapping->host;
++		if (!count)
++			goto out; /* skip atime */
++		size = i_size_read(inode);
++		if (pos < size) {
++			retval = filemap_write_and_wait_range(mapping, pos,
++					pos + iov_length(iov, nr_segs) - 1);
++			if (!retval) {
++				retval = mapping->a_ops->direct_IO(READ, iocb,
++							iov, pos, nr_segs);
++			}
++			if (retval > 0)
++				*ppos = pos + retval;
++			if (retval) {
++				file_accessed(filp);
++				goto out;
++			}
++		}
++	}
++
++	for (seg = 0; seg < nr_segs; seg++) {
++		read_descriptor_t desc;
++
++		desc.written = 0;
++		desc.arg.buf = iov[seg].iov_base;
++		desc.count = iov[seg].iov_len;
++		if (desc.count == 0)
++			continue;
++		desc.error = 0;
++		do_ext2bp_file_read(filp, ppos, &desc, ext2bp_file_read_actor);
++		retval += desc.written;
++		if (desc.error) {
++			retval = retval ?: desc.error;
++			break;
++		}
++		if (desc.count > 0)
++			break;
++	}
++out:
++	return retval;
++}
++EXPORT_SYMBOL(ext2bp_file_aio_read);
++
+ static ssize_t
+ do_readahead(struct address_space *mapping, struct file *filp,
+ 	     pgoff_t index, unsigned long nr)
+@@ -1589,12 +2007,207 @@
+ 	shrink_readahead_size_eio(file, ra);
+ 	return VM_FAULT_SIGBUS;
+ }
+-EXPORT_SYMBOL(filemap_fault);
++EXPORT_SYMBOL(filemap_fault);
++
++/**
++ * Vijay: Modified filemap fault routine for ext2bp.
++   Needed to change the offset and size calculation.
++ */
++int ext2bp_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++{
++	int error;
++	struct file *file = vma->vm_file;
++	struct address_space *mapping = file->f_mapping;
++	struct file_ra_state *ra = &file->f_ra;
++	struct inode *inode = mapping->host;
++	struct page *page;
++	pgoff_t size;
++	int did_readaround = 0;
++	int ret = 0;
++
++	/* Here, we are dealing with the _physical_ size of the 
++	   file. However, isize returns the logical size of the
++	   file. Hence we need to add the header size to the 
++	   isize. */
++	unsigned long vsize = i_size_read(inode);
++	unsigned long num_headers = 1 + vsize/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	// Subtract one if it is a perfect multiple
++	if(vsize%(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) == 0) num_headers--;
++	unsigned long total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++	vsize += total_header_size;
++
++	size = (vsize + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
++
++	if (vmf->pgoff >= size){
++		return VM_FAULT_SIGBUS;
++	}
++
++	/* If we don't want any read-ahead, don't bother */
++	if (VM_RandomReadHint(vma))
++		goto no_cached_page;
++
++	/*
++	 * Do we have something in the page cache already?
++	 */
++retry_find:
++	page = find_lock_page(mapping, vmf->pgoff);
++	/*
++	 * For sequential accesses, we use the generic readahead logic.
++	 */
++	if (VM_SequentialReadHint(vma)) {
++		if (!page) {
++			page_cache_sync_readahead(mapping, ra, file,
++							   vmf->pgoff, 1);
++			page = find_lock_page(mapping, vmf->pgoff);
++			if (!page)
++				goto no_cached_page;
++		}
++		if (PageReadahead(page)) {
++			page_cache_async_readahead(mapping, ra, file, page,
++							   vmf->pgoff, 1);
++		}
++	}
++
++	if (!page) {
++		unsigned long ra_pages;
++
++		ra->mmap_miss++;
++
++		/*
++		 * Do we miss much more than hit in this file? If so,
++		 * stop bothering with read-ahead. It will only hurt.
++		 */
++		if (ra->mmap_miss > MMAP_LOTSAMISS)
++			goto no_cached_page;
++
++		/*
++		 * To keep the pgmajfault counter straight, we need to
++		 * check did_readaround, as this is an inner loop.
++		 */
++		if (!did_readaround) {
++			ret = VM_FAULT_MAJOR;
++			count_vm_event(PGMAJFAULT);
++		}
++		did_readaround = 1;
++		ra_pages = max_sane_readahead(file->f_ra.ra_pages);
++		if (ra_pages) {
++			pgoff_t start = 0;
++
++			if (vmf->pgoff > ra_pages / 2)
++				start = vmf->pgoff - ra_pages / 2;
++			do_page_cache_readahead(mapping, file, start, ra_pages);
++		}
++		page = find_lock_page(mapping, vmf->pgoff);
++		if (!page)
++			goto no_cached_page;
++	}
++
++	if (!did_readaround)
++		ra->mmap_miss--;
++
++	/*
++	 * We have a locked page in the page cache, now we need to check
++	 * that it's up-to-date. If not, it is going to be due to an error.
++	 */
++	if (unlikely(!PageUptodate(page)))
++		goto page_not_uptodate;
++
++	/* Must recheck i_size under page lock */
++
++	/* Here, we are dealing with the _physical_ size of the 
++	   file. However, isize returns the logical size of the
++	   file. Hence we need to add the header size to the 
++	   isize. */
++	vsize = i_size_read(inode);
++	num_headers = 1 + vsize/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	// Subtract one if it is a perfect multiple
++	if(vsize%(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) == 0) num_headers--;
++	total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++	vsize += total_header_size;
++
++	size = (vsize + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
++
++	if (unlikely(vmf->pgoff >= size)) {
++		unlock_page(page);
++		page_cache_release(page);
++		return VM_FAULT_SIGBUS;
++	}
++
++	/*
++	 * Found the page and have a reference on it.
++	 */
++	mark_page_accessed(page);
++	//ra->prev_pos = (loff_t)page->index << PAGE_CACHE_SHIFT;
++	ra->prev_pos = (loff_t)page->index;
++	ra->prev_pos *= (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	vmf->page = page;
++	return ret | VM_FAULT_LOCKED;
++
++no_cached_page:
++	/*
++	 * We're only likely to ever get here if MADV_RANDOM is in
++	 * effect.
++	 */
++	error = page_cache_read(file, vmf->pgoff);
++
++	/*
++	 * The page we want has now been added to the page cache.
++	 * In the unlikely event that someone removed it in the
++	 * meantime, we'll just come back here and read it again.
++	 */
++	if (error >= 0)
++		goto retry_find;
++
++	/*
++	 * An error return from page_cache_read can result if the
++	 * system is low on memory, or a problem occurs while trying
++	 * to schedule I/O.
++	 */
++	if (error == -ENOMEM)
++		return VM_FAULT_OOM;
++	return VM_FAULT_SIGBUS;
++
++page_not_uptodate:
++	/* IO error path */
++	if (!did_readaround) {
++		ret = VM_FAULT_MAJOR;
++		count_vm_event(PGMAJFAULT);
++	}
++
++	/*
++	 * Umm, take care of errors if the page isn't up-to-date.
++	 * Try to re-read it _once_. We do this synchronously,
++	 * because there really aren't any performance issues here
++	 * and we need to check for errors.
++	 */
++	ClearPageError(page);
++	error = mapping->a_ops->readpage(file, page);
++	if (!error) {
++		wait_on_page_locked(page);
++		if (!PageUptodate(page))
++			error = -EIO;
++	}
++	page_cache_release(page);
++
++	if (!error || error == AOP_TRUNCATED_PAGE)
++		goto retry_find;
++
++	/* Things didn't work out. Return zero to tell the mm layer so. */
++	shrink_readahead_size_eio(file, ra);
++	return VM_FAULT_SIGBUS;
++}
++EXPORT_SYMBOL(ext2bp_filemap_fault);
+ 
+ struct vm_operations_struct generic_file_vm_ops = {
+ 	.fault		= filemap_fault,
+ };
+ 
++/* Vijay: Modified fault routine for ext2bp. Needed to 
++   change the size and the offsets */
++struct vm_operations_struct ext2bp_file_vm_ops = {
++	.fault		= ext2bp_filemap_fault,
++};
++
+ /* This is used for a general mmap of a disk file */
+ 
+ int generic_file_mmap(struct file * file, struct vm_area_struct * vma)
+@@ -1609,6 +2222,20 @@
+ 	return 0;
+ }
+ 
++/* Vijay: Modified mmap routine for ext2bp */
++int ext2bp_file_mmap(struct file * file, struct vm_area_struct * vma)
++{
++	struct address_space *mapping = file->f_mapping;
++		
++	if (!mapping->a_ops->readpage)
++		return -ENOEXEC;
++	file_accessed(file);
++	vma->vm_ops = &ext2bp_file_vm_ops;
++	vma->vm_flags |= VM_CAN_NONLINEAR;
++	return 0;
++}
++EXPORT_SYMBOL(ext2bp_file_mmap);
++
+ /*
+  * This is for filesystems which do not implement ->writepage.
+  */
+@@ -1944,6 +2571,88 @@
+ 
+ /*
+  * Performs necessary checks before doing a write
++ * Added by Vijay and Tushar.
++ * Can adjust writing position or amount of bytes to write.
++ * Returns appropriate error code that caller should return or
++ * zero in case that write should be allowed.
++ */
++inline int ext2bp_generic_write_checks(struct file *file, loff_t *pos, size_t *count, int isblk)
++{
++	struct inode *inode = file->f_mapping->host;
++	unsigned long limit = current->signal->rlim[RLIMIT_FSIZE].rlim_cur;
++
++        if (unlikely(*pos < 0))
++                return -EINVAL;
++
++	if (!isblk) {
++		/* FIXME: this is for backwards compatibility with 2.4 */
++		if (file->f_flags & O_APPEND)
++				*pos = i_size_read(inode);
++
++		if (limit != RLIM_INFINITY) {
++			if (*pos >= limit) {
++				send_sig(SIGXFSZ, current, 0);
++				return -EFBIG;
++			}
++			if (*count > limit - (typeof(limit))*pos) {
++				*count = limit - (typeof(limit))*pos;
++			}
++		}
++	}
++
++	/*
++	 * LFS rule
++	 */
++	if (unlikely(*pos + *count > MAX_NON_LFS &&
++				!(file->f_flags & O_LARGEFILE))) {
++		if (*pos >= MAX_NON_LFS) {
++			return -EFBIG;
++		}
++		if (*count > MAX_NON_LFS - (unsigned long)*pos) {
++			*count = MAX_NON_LFS - (unsigned long)*pos;
++		}
++	}
++
++	/*
++	 * Are we about to exceed the fs block limit ?
++	 *
++	 * If we have written data it becomes a short write.  If we have
++	 * exceeded without writing data we send a signal and return EFBIG.
++	 * Linus frestrict idea will clean these up nicely..
++	 */
++	if (likely(!isblk)) {
++		if (unlikely(*pos >= inode->i_sb->s_maxbytes)) {
++			if (*count || *pos > inode->i_sb->s_maxbytes) {
++				return -EFBIG;
++			}
++			/* zero-length writes at ->s_maxbytes are OK */
++		}
++
++		if (unlikely(*pos + *count > inode->i_sb->s_maxbytes))
++			*count = inode->i_sb->s_maxbytes - *pos;
++	} else {
++#ifdef CONFIG_BLOCK
++		loff_t isize;
++		if (bdev_read_only(I_BDEV(inode)))
++			return -EPERM;
++		isize = i_size_read(inode);
++		if (*pos >= isize) {
++			if (*count || *pos > isize)
++				return -ENOSPC;
++		}
++
++		if (*pos + *count > isize)
++			*count = isize - *pos;
++#else
++		return -EPERM;
++#endif
++	}
++	return 0;
++}
++EXPORT_SYMBOL(ext2bp_generic_write_checks);
++
++/*
++ * Performs necessary checks before doing a write
+  *
+  * Can adjust writing position or amount of bytes to write.
+  * Returns appropriate error code that caller should return or
+@@ -2222,7 +2931,180 @@
+ 	}
+ 	return page;
+ }
+-EXPORT_SYMBOL(grab_cache_page_write_begin);
++EXPORT_SYMBOL(grab_cache_page_write_begin);
++
++/*
++ *	generic_perform_write_2copy changed for ext2bp
++ *	Author: Vijay and Tushar
++ */
++static ssize_t ext2bp_perform_write_2copy(struct file *file,
++				struct iov_iter *i, loff_t pos)
++{
++	struct address_space *mapping = file->f_mapping;
++	const struct address_space_operations *a_ops = mapping->a_ops;
++	struct inode *inode = mapping->host;
++	long status = 0;
++	ssize_t written = 0;
++
++	do {
++		struct page *src_page;
++		struct page *page;
++		pgoff_t index;		/* Pagecache index for current page */
++		unsigned long offset;	/* Offset into pagecache page */
++		unsigned long bytes;	/* Bytes to write to page */
++		size_t copied;		/* Bytes copied from user */
++
++		// Vijay: Changed for ext2bp
++		offset = ((unsigned long)pos) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) + EXT2BP_HEADER_SIZE;
++		index = ((unsigned long) pos) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++		bytes = min_t(unsigned long, PAGE_CACHE_SIZE - offset,
++						iov_iter_count(i));
++	
++		/*
++		 * a non-NULL src_page indicates that we're doing the
++		 * copy via get_user_pages and kmap.
++		 */
++		src_page = NULL;
++
++		/*
++		 * Bring in the user page that we will copy from _first_.
++		 * Otherwise there's a nasty deadlock on copying from the
++		 * same page as we're writing to, without it being marked
++		 * up-to-date.
++		 *
++		 * Not only is this an optimisation, but it is also required
++		 * to check that the address is actually valid, when atomic
++		 * usercopies are used, below.
++		 */
++		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
++			status = -EFAULT;
++			break;
++		}
++
++		page = grab_cache_page_write_begin(mapping, index, 0);
++		if (!page) {
++			status = -ENOMEM;
++			break;
++		}
++
++		/*
++		 * non-uptodate pages cannot cope with short copies, and we
++		 * cannot take a pagefault with the destination page locked.
++		 * So pin the source page to copy it.
++		 */
++		if (!PageUptodate(page) && !segment_eq(get_fs(), KERNEL_DS)) {
++			unlock_page(page);
++
++			src_page = alloc_page(GFP_KERNEL);
++			if (!src_page) {
++				page_cache_release(page);
++				status = -ENOMEM;
++				break;
++			}
++
++			/*
++			 * Cannot get_user_pages with a page locked for the
++			 * same reason as we can't take a page fault with a
++			 * page locked (as explained below).
++			 */
++			copied = iov_iter_copy_from_user(src_page, i,
++								offset, bytes);
++			if (unlikely(copied == 0)) {
++				status = -EFAULT;
++				page_cache_release(page);
++				page_cache_release(src_page);
++				break;
++			}
++			bytes = copied;
++
++			lock_page(page);
++			/*
++			 * Can't handle the page going uptodate here, because
++			 * that means we would use non-atomic usercopies, which
++			 * zero out the tail of the page, which can cause
++			 * zeroes to become transiently visible. We could just
++			 * use a non-zeroing copy, but the APIs aren't too
++			 * consistent.
++			 */
++			if (unlikely(!page->mapping || PageUptodate(page))) {
++				unlock_page(page);
++				page_cache_release(page);
++				page_cache_release(src_page);
++				continue;
++			}
++		}
++
++		status = a_ops->prepare_write(file, page, offset, offset+bytes);
++		if (unlikely(status))
++			goto fs_write_aop_error;
++
++		if (!src_page) {
++			/*
++			 * Must not enter the pagefault handler here, because
++			 * we hold the page lock, so we might recursively
++			 * deadlock on the same lock, or get an ABBA deadlock
++			 * against a different lock, or against the mmap_sem
++			 * (which nests outside the page lock).  So increment
++			 * preempt count, and use _atomic usercopies.
++			 *
++			 * The page is uptodate so we are OK to encounter a
++			 * short copy: if unmodified parts of the page are
++			 * marked dirty and written out to disk, it doesn't
++			 * really matter.
++			 */
++			pagefault_disable();
++			copied = iov_iter_copy_from_user_atomic(page, i,
++								offset, bytes);
++			pagefault_enable();
++		} else {
++			void *src, *dst;
++			src = kmap_atomic(src_page, KM_USER0);
++			dst = kmap_atomic(page, KM_USER1);
++			memcpy(dst + offset, src + offset, bytes);
++			kunmap_atomic(dst, KM_USER1);
++			kunmap_atomic(src, KM_USER0);
++			copied = bytes;
++		}
++		flush_dcache_page(page);
++
++		status = a_ops->commit_write(file, page, offset, offset+bytes);
++		if (unlikely(status < 0))
++			goto fs_write_aop_error;
++		if (unlikely(status > 0)) /* filesystem did partial write */
++			copied = min_t(size_t, copied, status);
++
++		unlock_page(page);
++		mark_page_accessed(page);
++		page_cache_release(page);
++		if (src_page)
++			page_cache_release(src_page);
++
++		iov_iter_advance(i, copied);
++		pos += copied;
++		written += copied;
++
++		balance_dirty_pages_ratelimited(mapping);
++		cond_resched();
++		continue;
++
++fs_write_aop_error:
++		unlock_page(page);
++		page_cache_release(page);
++		if (src_page)
++			page_cache_release(src_page);
++
++		/*
++		 * prepare_write() may have instantiated a few blocks
++		 * outside i_size.  Trim these off again. Don't need
++		 * i_size_read because we hold i_mutex.
++		 */
++		if (pos + bytes > inode->i_size)
++			vmtruncate(inode, inode->i_size);
++		break;
++	} while (iov_iter_count(i));
++
++	return written ? written : status;
++}
+ 
+ static ssize_t generic_perform_write_2copy(struct file *file,
+ 				struct iov_iter *i, loff_t pos)
+@@ -2392,6 +3274,97 @@
+ 	return written ? written : status;
+ }
+ 
++/*
++ * Generic perform write modified for ext2bp
++ * Author: Vijay and Tushar
++ */
++ssize_t ext2bp_perform_write(struct file *file,
++				struct iov_iter *i, loff_t pos)
++{
++	struct address_space *mapping = file->f_mapping;
++	const struct address_space_operations *a_ops = mapping->a_ops;
++	long status = 0;
++	ssize_t written = 0;
++	unsigned int flags = 0;
++
++	/*
++	 * Copies from kernel address space cannot fail (NFSD is a big user).
++	 */
++	if (segment_eq(get_fs(), KERNEL_DS))
++		flags |= AOP_FLAG_UNINTERRUPTIBLE;
++
++	do {
++		struct page *page;
++		pgoff_t index;		/* Pagecache index for current page */
++		unsigned long offset;	/* Offset into pagecache page */
++		unsigned long bytes;	/* Bytes to write to page */
++		size_t copied;		/* Bytes copied from user */
++		void *fsdata;
++
++		offset =((unsigned long) (pos)) % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE) + EXT2BP_HEADER_SIZE;
++		index = ((unsigned long) pos) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++		bytes = min_t(unsigned long, PAGE_CACHE_SIZE - offset,
++						iov_iter_count(i));
++
++again:
++
++		/*
++		 * Bring in the user page that we will copy from _first_.
++		 * Otherwise there's a nasty deadlock on copying from the
++		 * same page as we're writing to, without it being marked
++		 * up-to-date.
++		 *
++		 * Not only is this an optimisation, but it is also required
++		 * to check that the address is actually valid, when atomic
++		 * usercopies are used, below.
++		 */
++		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
++			status = -EFAULT;
++			break;
++		}
++
++		status = a_ops->write_begin(file, mapping, pos, bytes, flags,
++						&page, &fsdata);
++		if (unlikely(status))
++			break;
++
++		pagefault_disable();
++		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
++		pagefault_enable();
++		flush_dcache_page(page);
++
++		BUG_ON( copied != bytes);
++		mark_page_accessed(page);
++		status = a_ops->write_end(file, mapping, pos, bytes, copied,
++						page, fsdata);
++		if (unlikely(status < 0))
++			break;
++		copied = status;
++
++		cond_resched();
++
++		iov_iter_advance(i, copied);
++		if (unlikely(copied == 0)) {
++			/*
++			 * If we were unable to copy any data at all, we must
++			 * fall back to a single segment length write.
++			 *
++			 * If we didn't fallback here, we could livelock
++			 * because not all segments in the iov can be copied at
++			 * once without a pagefault.
++			 */
++			bytes = min_t(unsigned long, PAGE_CACHE_SIZE - offset,
++						iov_iter_single_seg_count(i));
++			goto again;
++		}
++		pos += copied;
++		written += copied;
++		balance_dirty_pages_ratelimited(mapping);
++	} while (iov_iter_count(i));
++
++	return written ? written : status;
++}
++
+ static ssize_t generic_perform_write(struct file *file,
+ 				struct iov_iter *i, loff_t pos)
+ {
+@@ -2526,6 +3499,57 @@
+ }
+ EXPORT_SYMBOL(generic_file_buffered_write);
+ 
++/*	
++ *	File buffered write modified for ext2bp
++ *	Author: Vijay and Tushar
++ */
++ssize_t
++ext2bp_file_buffered_write(struct kiocb *iocb, const struct iovec *iov,
++		unsigned long nr_segs, loff_t pos, loff_t *ppos,
++		size_t count, ssize_t written)
++{
++	struct file *file = iocb->ki_filp;
++	struct address_space *mapping = file->f_mapping;
++	const struct address_space_operations *a_ops = mapping->a_ops;
++	struct inode *inode = mapping->host;
++	ssize_t status;
++	struct iov_iter i;
++
++	iov_iter_init(&i, iov, nr_segs, count, written);
++	if (a_ops->write_begin)
++		status = ext2bp_perform_write(file, &i, pos);
++	else
++		status = ext2bp_perform_write_2copy(file, &i, pos);
++
++	if (likely(status >= 0)) {
++		written += status;
++		*ppos = pos + status;
++
++		/*
++		 * For now, when the user asks for O_SYNC, we'll actually give
++		 * O_DSYNC
++		 */
++		if (unlikely((file->f_flags & O_SYNC) || IS_SYNC(inode))) {
++			if (!a_ops->writepage || !is_sync_kiocb(iocb))
++				status = generic_osync_inode(inode, mapping,
++						OSYNC_METADATA|OSYNC_DATA);
++		}
++  	}
++	
++	/*
++	 * If we get here for O_DIRECT writes then we must have fallen through
++	 * to buffered writes (block instantiation inside i_size).  So we sync
++	 * the file data here, to try to honour O_DIRECT expectations.
++	 */
++	if (unlikely(file->f_flags & O_DIRECT) && written) {
++		status = filemap_write_and_wait_range(mapping,
++					pos, pos + written - 1);
++	}
++
++	return written ? written : status;
++}
++EXPORT_SYMBOL(ext2bp_file_buffered_write);
++
+ static ssize_t
+ __generic_file_aio_write_nolock(struct kiocb *iocb, const struct iovec *iov,
+ 				unsigned long nr_segs, loff_t *ppos)
+@@ -2626,6 +3650,112 @@
+ 	return written ? written : err;
+ }
+ 
++/*
++*	file aio write no lock modified for ext2bp
++*	Author: Vijay and Tushar
++*
++*/
++ssize_t
++__ext2bp_file_aio_write_nolock(struct kiocb *iocb, const struct iovec *iov,
++				unsigned long nr_segs, loff_t *ppos)
++{
++	struct file *file = iocb->ki_filp;
++	struct address_space * mapping = file->f_mapping;
++	size_t ocount;		/* original count */
++	size_t count;		/* after file limit checks */
++	struct inode 	*inode = mapping->host;
++	loff_t		pos;
++	ssize_t		written;
++	ssize_t		err;
++
++	ocount = 0;
++	err = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
++	if (err)
++		return err;
++
++	count = ocount;
++	pos = *ppos;
++
++	vfs_check_frozen(inode->i_sb, SB_FREEZE_WRITE);
++
++	/* We can write back this queue in page reclaim */
++	current->backing_dev_info = mapping->backing_dev_info;
++	written = 0;
++
++	err = ext2bp_generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
++	if (err)
++		goto out;
++
++	if (count == 0)
++		goto out;
++
++	err = file_remove_suid(file);
++	if (err)
++		goto out;
++
++	file_update_time(file);
++
++	/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
++	if (unlikely(file->f_flags & O_DIRECT)) {
++
++		loff_t endbyte;
++		ssize_t written_buffered;
++
++		written = generic_file_direct_write(iocb, iov, &nr_segs, pos,
++							ppos, count, ocount);
++		if (written < 0 || written == count)
++			goto out;
++		/*
++		 * direct-io write to a hole: fall through to buffered I/O
++		 * for completing the rest of the request.
++		 */
++		pos += written;
++		count -= written;
++		written_buffered = generic_file_buffered_write(iocb, iov,
++						nr_segs, pos, ppos, count,
++						written);
++		/*
++		 * If generic_file_buffered_write() retuned a synchronous error
++		 * then we want to return the number of bytes which were
++		 * direct-written, or the error code if that was zero.  Note
++		 * that this differs from normal direct-io semantics, which
++		 * will return -EFOO even if some bytes were written.
++		 */
++		if (written_buffered < 0) {
++			err = written_buffered;
++			goto out;
++		}
++
++		/*
++		 * We need to ensure that the page cache pages are written to
++		 * disk and invalidated to preserve the expected O_DIRECT
++		 * semantics.
++		 */
++		endbyte = pos + written_buffered - written - 1;
++		err = do_sync_mapping_range(file->f_mapping, pos, endbyte,
++					    SYNC_FILE_RANGE_WAIT_BEFORE|
++					    SYNC_FILE_RANGE_WRITE|
++					    SYNC_FILE_RANGE_WAIT_AFTER);
++		if (err == 0) {
++			written = written_buffered;
++			invalidate_mapping_pages(mapping,
++						 pos >> PAGE_CACHE_SHIFT,
++						 endbyte >> PAGE_CACHE_SHIFT);
++		} else {
++			/*
++			 * We don't know how much we wrote, so just return
++			 * the number of bytes which were direct-written
++			 */
++		}
++	} else {
++		written = ext2bp_file_buffered_write(iocb, iov, nr_segs,
++				pos, ppos, count, written);
++	}
++out:
++	current->backing_dev_info = NULL;
++	return written ? written : err;
++}
++
+ ssize_t generic_file_aio_write_nolock(struct kiocb *iocb,
+ 		const struct iovec *iov, unsigned long nr_segs, loff_t pos)
+ {
+@@ -2676,6 +3806,35 @@
+ }
+ EXPORT_SYMBOL(generic_file_aio_write);
+ 
++/*
++ * generic_file_aoi_write
++ *
++ */
++ssize_t ext2bp_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
++		unsigned long nr_segs, loff_t pos)
++{
++	struct file *file = iocb->ki_filp;
++	struct address_space *mapping = file->f_mapping;
++	struct inode *inode = mapping->host;
++	ssize_t ret;
++	BUG_ON(iocb->ki_pos != pos);
++
++	mutex_lock(&inode->i_mutex);
++	ret = __ext2bp_file_aio_write_nolock(iocb, iov, nr_segs,
++			&iocb->ki_pos);
++	mutex_unlock(&inode->i_mutex);
++
++	if (ret > 0 && ((file->f_flags & O_SYNC) || IS_SYNC(inode))) {
++		ssize_t err;
++
++		err = sync_page_range(inode, mapping, pos, ret);
++		if (err < 0)
++			ret = err;
++	}
++	return ret;
++}
++EXPORT_SYMBOL(ext2bp_file_aio_write);
++
+ /**
+  * try_to_release_page() - release old fs-specific metadata on a page
+  *
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/mm/readahead.c linux/mm/readahead.c
+--- linux-2.6.27.55/mm/readahead.c	2010-10-28 23:04:39.000000000 -0500
++++ linux/mm/readahead.c	2012-10-13 17:38:04.000000000 -0500
+@@ -175,6 +175,73 @@
+ 	return ret;
+ }
+ 
++/* 
++ * Ext2bp specific version of __do_page_cache_readahead. The main
++ * difference is the end index calculation.
++ */
++static int
++__ext2bp_do_page_cache_readahead(struct address_space *mapping, struct file *filp,
++			pgoff_t offset, unsigned long nr_to_read,
++			unsigned long lookahead_size)
++{
++	struct inode *inode = mapping->host;
++	struct page *page;
++	unsigned long end_index;	/* The last page we want to read */
++	LIST_HEAD(page_pool);
++	int page_idx;
++	int ret = 0;
++	loff_t isize = i_size_read(inode);
++
++	if (isize == 0)
++		goto out;
++
++	/* Ext2bp specific page offset calculations */
++	unsigned long vsize = isize;
++	unsigned long num_headers = 1 + vsize/(PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	// Subtract one if it is a perfect multiple
++	if((vsize % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE)) == 0) num_headers--;
++	unsigned long total_header_size = num_headers * EXT2BP_HEADER_SIZE;
++	vsize += total_header_size;
++
++	end_index = (vsize - 1) >> PAGE_CACHE_SHIFT;
++
++	/*
++	 * Preallocate as many pages as we will need.
++	 */
++	for (page_idx = 0; page_idx < nr_to_read; page_idx++) {
++		pgoff_t page_offset = offset + page_idx;
++
++		if (page_offset > end_index)
++			break;
++
++		rcu_read_lock();
++		page = radix_tree_lookup(&mapping->page_tree, page_offset);
++		rcu_read_unlock();
++		if (page)
++			continue;
++
++		page = page_cache_alloc_cold(mapping);
++		if (!page)
++			break;
++		page->index = page_offset;
++		list_add(&page->lru, &page_pool);
++		if (page_idx == nr_to_read - lookahead_size)
++			SetPageReadahead(page);
++		ret++;
++	}
++
++	/*
++	 * Now start the IO.  We ignore I/O errors - if the page is not
++	 * uptodate then the caller will launch readpage again, and
++	 * will then handle the error.
++	 */
++	if (ret)
++		read_pages(mapping, filp, &page_pool, ret);
++	BUG_ON(!list_empty(&page_pool));
++out:
++	return ret;
++}
++
+ /*
+  * Chunk the readahead into 2 megabyte units, so that we don't pin too much
+  * memory at once.
+@@ -260,6 +327,20 @@
+ }
+ 
+ /*
++ * Ext2bp specific ra_submit - call a ext2bp read ahead function.
++ */
++static unsigned long ext2bp_ra_submit(struct file_ra_state *ra,
++		       struct address_space *mapping, struct file *filp)
++{
++	int actual;
++
++	actual = __ext2bp_do_page_cache_readahead(mapping, filp,
++					ra->start, ra->size, ra->async_size);
++
++	return actual;
++}
++
++/*
+  * Set the initial window size, round to next power of 2 and square
+  * for small size, x 4 for medium, and x 2 for large
+  * for 128k (32 page) max ra
+@@ -411,6 +492,83 @@
+ 	return ra_submit(ra, mapping, filp);
+ }
+ 
++/*
++ * Ext2bp specific version of ondemand_readahead. The main changes
++ * being calls to ext2bp specific page readahead functions.
++ */
++static unsigned long
++ext2bp_ondemand_readahead(struct address_space *mapping,
++		   struct file_ra_state *ra, struct file *filp,
++		   bool hit_readahead_marker, pgoff_t offset,
++		   unsigned long req_size)
++{
++	int	max = ra->ra_pages;	/* max readahead pages */
++	pgoff_t prev_offset;
++	int	sequential;
++
++	/*
++	 * It's the expected callback offset, assume sequential access.
++	 * Ramp up sizes, and push forward the readahead window.
++	 */
++	if (offset && (offset == (ra->start + ra->size - ra->async_size) ||
++			offset == (ra->start + ra->size))) {
++		ra->start += ra->size;
++		ra->size = get_next_ra_size(ra, max);
++		ra->async_size = ra->size;
++		goto readit;
++	}
++
++	// Change this to ext2bp specific offsets
++	prev_offset = ra->prev_pos / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	sequential = offset - prev_offset <= 1UL || req_size > max;
++
++	/*
++	 * Standalone, small read.
++	 * Read as is, and do not pollute the readahead state.
++	 */
++	if (!hit_readahead_marker && !sequential) {
++		return __ext2bp_do_page_cache_readahead(mapping, filp,
++						offset, req_size, 0);
++	}
++
++	/*
++	 * Hit a marked page without valid readahead state.
++	 * E.g. interleaved reads.
++	 * Query the pagecache for async_size, which normally equals to
++	 * readahead size. Ramp it up and use it as the new readahead size.
++	 */
++	if (hit_readahead_marker) {
++		pgoff_t start;
++
++		rcu_read_lock();
++		start = radix_tree_next_hole(&mapping->page_tree, offset,max+1);
++		rcu_read_unlock();
++
++		if (!start || start - offset > max)
++			return 0;
++
++		ra->start = start;
++		ra->size = start - offset;	/* old async_size */
++		ra->size = get_next_ra_size(ra, max);
++		ra->async_size = ra->size;
++		goto readit;
++	}
++
++	/*
++	 * It may be one of
++	 * 	- first read on start of file
++	 * 	- sequential cache miss
++	 * 	- oversize random read
++	 * Start readahead for it.
++	 */
++	ra->start = offset;
++	ra->size = get_init_ra_size(req_size, max);
++	ra->async_size = ra->size > req_size ? ra->size - req_size : ra->size;
++
++readit:
++	return ext2bp_ra_submit(ra, mapping, filp);
++}
++
+ /**
+  * page_cache_sync_readahead - generic file readahead
+  * @mapping: address_space which holds the pagecache and I/O vectors
+@@ -481,3 +639,36 @@
+ 	ondemand_readahead(mapping, ra, filp, true, offset, req_size);
+ }
+ EXPORT_SYMBOL_GPL(page_cache_async_readahead);
++
++/* 
++ * Modified readahead function for ext2bp. The only difference is that 
++ * a ext2bp specific on demand readahed function will be called instead
++ * of a generic one. 
++ */
++void ext2bp_page_cache_async_readahead(struct address_space *mapping,
++			   struct file_ra_state *ra, struct file *filp,
++			   struct page *page, pgoff_t offset,
++			   unsigned long req_size)
++{
++	/* no read-ahead */
++	if (!ra->ra_pages)
++		return;
++
++	/*
++	 * Same bit is used for PG_readahead and PG_reclaim.
++	 */
++	if (PageWriteback(page))
++		return;
++
++	ClearPageReadahead(page);
++
++	/*
++	 * Defer asynchronous read-ahead on IO congestion.
++	 */
++	if (bdi_read_congested(mapping->backing_dev_info))
++		return;
++
++	/* do read-ahead */
++	ext2bp_ondemand_readahead(mapping, ra, filp, true, offset, req_size);
++}
++EXPORT_SYMBOL_GPL(ext2bp_page_cache_async_readahead);
+diff -uNr -x '.*' -x '*.o' linux-2.6.27.55/mm/truncate.c linux/mm/truncate.c
+--- linux-2.6.27.55/mm/truncate.c	2010-10-28 23:04:39.000000000 -0500
++++ linux/mm/truncate.c	2012-10-13 17:39:48.000000000 -0500
+@@ -251,6 +251,105 @@
+ }
+ EXPORT_SYMBOL(truncate_inode_pages_range);
+ 
++/* Vijay: truncate_inode_pages_range modified for ext2bp. Need to change the
++   calculation of the offsets
++*/
++void ext2bp_truncate_inode_pages_range(struct address_space *mapping,
++				loff_t lstart, loff_t lend)
++{
++	const pgoff_t start = ((unsigned long)lstart + PAGE_CACHE_SIZE -EXT2BP_HEADER_SIZE -1) / (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	pgoff_t end;
++	const unsigned partial = (unsigned long)lstart % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++	struct pagevec pvec;
++	pgoff_t next;
++	int i;
++
++	if (mapping->nrpages == 0)
++		return;
++
++	BUG_ON((lend & (PAGE_CACHE_SIZE - 1)) != (PAGE_CACHE_SIZE - 1));
++	end = (unsigned long)lend % (PAGE_CACHE_SIZE - EXT2BP_HEADER_SIZE);
++
++	pagevec_init(&pvec, 0);
++	next = start;
++	while (next <= end &&
++	       pagevec_lookup(&pvec, mapping, next, PAGEVEC_SIZE)) {
++		for (i = 0; i < pagevec_count(&pvec); i++) {
++			struct page *page = pvec.pages[i];
++			pgoff_t page_index = page->index;
++
++			if (page_index > end) {
++				next = page_index;
++				break;
++			}
++
++			if (page_index > next)
++				next = page_index;
++			next++;
++			if (!trylock_page(page))
++				continue;
++			if (PageWriteback(page)) {
++				unlock_page(page);
++				continue;
++			}
++			if (page_mapped(page)) {
++				unmap_mapping_range(mapping,
++				  (loff_t)page_index<<PAGE_CACHE_SHIFT,
++				  PAGE_CACHE_SIZE, 0);
++			}
++			truncate_complete_page(mapping, page);
++			unlock_page(page);
++		}
++		pagevec_release(&pvec);
++		cond_resched();
++	}
++
++	if (partial) {
++		struct page *page = find_lock_page(mapping, start - 1);
++		if (page) {
++			wait_on_page_writeback(page);
++			truncate_partial_page(page, partial);
++			unlock_page(page);
++			page_cache_release(page);
++		}
++	}
++
++	next = start;
++	for ( ; ; ) {
++		cond_resched();
++		if (!pagevec_lookup(&pvec, mapping, next, PAGEVEC_SIZE)) {
++			if (next == start)
++				break;
++			next = start;
++			continue;
++		}
++		if (pvec.pages[0]->index > end) {
++			pagevec_release(&pvec);
++			break;
++		}
++		for (i = 0; i < pagevec_count(&pvec); i++) {
++			struct page *page = pvec.pages[i];
++
++			if (page->index > end)
++				break;
++			lock_page(page);
++			wait_on_page_writeback(page);
++			if (page_mapped(page)) {
++				unmap_mapping_range(mapping,
++				  (loff_t)page->index<<PAGE_CACHE_SHIFT,
++				  PAGE_CACHE_SIZE, 0);
++			}
++			if (page->index > next)
++				next = page->index;
++			next++;
++			truncate_complete_page(mapping, page);
++			unlock_page(page);
++		}
++		pagevec_release(&pvec);
++	}
++}
++EXPORT_SYMBOL(ext2bp_truncate_inode_pages_range);
++
+ /**
+  * truncate_inode_pages - truncate *all* the pages from an offset
+  * @mapping: mapping to truncate
+@@ -264,6 +363,13 @@
+ }
+ EXPORT_SYMBOL(truncate_inode_pages);
+ 
++/* Modified function for ext2bp. Needed to modify the offsets calculated */
++void ext2bp_truncate_inode_pages(struct address_space *mapping, loff_t lstart)
++{
++	truncate_inode_pages_range(mapping, lstart, (loff_t)-1);
++}
++EXPORT_SYMBOL(ext2bp_truncate_inode_pages);
++
+ unsigned long __invalidate_mapping_pages(struct address_space *mapping,
+ 				pgoff_t start, pgoff_t end, bool be_atomic)
+ {
