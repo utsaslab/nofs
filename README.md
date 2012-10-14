@@ -3,7 +3,7 @@ The No-Order File System
 
 *The No-Order File System (NoFS) is a simple, lightweight file system that employs a novel technique called backpointer-based consistency to provide crash consistency without ordering writes as they go to disk. NoFS is robust to crashes, and delivers excellent performance across a range of workloads.*
 
-The NoFS [project page](http://pages.cs.wisc.edu/~vijayc/nofs.htm) provides a high level overview. For technical details, please read the [FAST 2012](http://static.usenix.org/events/fast12/) paper [Consistency Without Ordering](http://www.cs.wisc.edu/adsl/Publications/nofs-fast12.pdf). Please cite this publication if you use this work.
+The NoFS [project page](http://pages.cs.wisc.edu/~vijayc/nofs.htm) provides a high level overview. For technical details, please read the [FAST 2012](http://static.usenix.org/events/fast12/) paper [Consistency Without Ordering](http://www.cs.wisc.edu/adsl/Publications/nofs-fast12.pdf). Please [cite this publication](http://research.cs.wisc.edu/adsl/Publications/nofs-fast12.bib) if you use this work.
 
 This project contains the linux kernel and file system code that we used in the paper. Another name for NoFS is ext2bp (reflecting that the code is the result of adding backpointers (bp) to ext2). The term ext2bp is used extensively in the code.  
 
