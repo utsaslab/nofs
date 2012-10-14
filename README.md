@@ -27,10 +27,16 @@ This includes changes to the Linux 2.6.27.55 kernel to support NoFS. This patch 
 * Make the new NoFS file system
 <pre>cd misc; ./mke2bfs /dev/sdb</pre>
 
+* Patch the kernel.
+<pre>cd linux-2.6.27.55/; patch -p1 < nofs_kernel.patch; </pre>
+
 * Compile and install the kernel.
-<pre>cd linux-2.6.27.55/; make; make modules; make modules_install; make install</pre>
+<pre>make; make modules; make modules_install; make install</pre>
 
 * Reboot the machine into the new kernel.
+
+* Extract the ext2bp folder and move into the kernel tree
+<pre>mv ext2bp linux-2.6.27.55/fs/</pre>
 
 * Compile the kernel module
 <pre>cd linux-2.6.27.55/fs/ext2bp; make</pre>
