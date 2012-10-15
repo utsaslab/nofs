@@ -7,6 +7,8 @@ The NoFS [project page](http://pages.cs.wisc.edu/~vijayc/nofs.htm) provides a hi
 
 This project contains the linux kernel and file system code that we used in the paper. Another name for NoFS is ext2bp (reflecting that the code is the result of adding backpointers (bp) to ext2). The term ext2bp is used extensively in the code.  
 
+Please feel free to <a href="http://cs.wisc.edu/~vijayc">contact me</a> with any questions.
+
 #### Description
 
 The code has three main parts. 
