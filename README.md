@@ -28,7 +28,7 @@ This includes changes to the Linux 2.6.27.55 kernel to support NoFS. This patch 
 <pre>cd misc; ./mke2bfs /dev/sdb</pre>
 
 * Patch the kernel.
-<pre>cd linux-2.6.27.55/; patch -p1 < nofs_kernel.patch; </pre>
+<pre>cd linux-2.6.27.55/; patch -p1 \< nofs_kernel.patch; </pre>
 
 * Compile and install the kernel.
 <pre>make; make modules; make modules_install; make install</pre>
