@@ -14,10 +14,10 @@ Please feel free to <a href="http://cs.wisc.edu/~vijayc">contact me</a> with any
 The code has three main parts. 
 
 **e2fsprogs-1.41.12**
-This is a modified version of e2fsprogs. It allows the user to create a nofs file system (mke2bpfs) and debug it (debugfs).
+This is a modified version of e2fsprogs. It allows the user to create a NoFS file system (mke2bpfs) and debug it (debugfs).
 
 **ext2bp** 
-This is the core NoFS file system. It is written as an independent kernel module. It has some dependencies in the kernel which are provided by the kernel patch. 
+This is the core NoFS file system. It is written as a loadable kernel module. It has some dependencies in the kernel which are provided by the kernel patch. 
 
 **nofs_kernel.patch**
 This includes changes to the Linux 2.6.27.55 kernel to support NoFS. This patch has to be applied to the kernel before NoFS can be run in it.   
@@ -51,4 +51,6 @@ This includes changes to the Linux 2.6.27.55 kernel to support NoFS. This patch 
 
 #### Caveats 
 
-This version of the code does not contain block offsets. Backpointers only contain inode numbers. We intend to clean up and upload the version that includes block offsets soon. The code is a bit more verbose than strictly required as many functions were introduced purely for debugging purposes.  
+This version of the code does not contain block offsets. Backpointers only contain inode numbers. We intend to clean up and upload the version that includes block offsets soon. The code is a bit more verbose than strictly required as many functions were introduced purely for debugging purposes.
+
+Note that the code is provided "as is": compiling and running the code will require some tweaking based on the operating system environment. The file system is only meant as a prototype and not meant for production use in any way.
